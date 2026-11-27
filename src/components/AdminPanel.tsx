@@ -1,10 +1,13 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from 'react';
 import {
+  Bike,
   ClipboardList,
   Edit3,
   Gift,
+  ImagePlus,
   Layers,
   Lock,
+  MapPin,
   Package,
   Plus,
   RefreshCw,
@@ -12,12 +15,16 @@ import {
   Store,
   Tag,
   Trash2,
+  UserPlus,
   X,
 } from 'lucide-react';
 import { api, type AdminRouletteResponse } from '../lib/api';
-import { formatBRL, formatCepInput, formatDateTimeBR } from '../lib/format';
+import { formatBRL, formatCepInput, formatDateTimeBR, formatWhatsappInput } from '../lib/format';
+import { compressImageFileToDataUrl } from '../lib/imageUpload';
+import { isTrackingAvailableForOrder } from '../lib/tracking';
 import type {
   CarouselSlide,
+  CourierSummary,
   Coupon,
   Order,
   OrderStatus,
@@ -30,16 +37,19 @@ import { SafeProductImage } from './BrandMark';
 
 interface AdminPanelProps {
   token: string | null;
+  liveSyncTrigger?: number;
   onStoreDataChanged: () => void;
+  onOpenTracking: (orderId: number) => void;
 }
 
-type AdminTab = 'orders' | 'products' | 'coupons' | 'carousel' | 'roulette' | 'settings';
+type AdminTab = 'orders' | 'couriers' | 'products' | 'coupons' | 'carousel' | 'roulette' | 'settings';
 
 const ORDER_STATUSES: OrderStatus[] = [
   'Pendente',
   'Confirmado',
   'Em preparo',
   'Saiu para entrega',
+  'Entregue',
   'Pronto para retirada',
   'Concluído',
   'Cancelado',
@@ -53,7 +63,12 @@ const PRESET_IMAGES = [
   { label: 'Pod System', url: '/src/assets/images/product_pod_device_1795779511951.jpg' },
 ];
 
-export function AdminPanel({ token, onStoreDataChanged }: AdminPanelProps) {
+export function AdminPanel({
+  token,
+  liveSyncTrigger = 0,
+  onStoreDataChanged,
+  onOpenTracking,
+}: AdminPanelProps) {
   const [tab, setTab] = useState<AdminTab>('orders');
   const [loading, setLoading] = useState(true);
   const [togglingStore, setTogglingStore] = useState(false);
@@ -61,6 +76,7 @@ export function AdminPanel({ token, onStoreDataChanged }: AdminPanelProps) {
   const [feedback, setFeedback] = useState('');
 
   const [orders, setOrders] = useState<Order[]>([]);
+  const [couriers, setCouriers] = useState<CourierSummary[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
   const [coupons, setCoupons] = useState<Coupon[]>([]);
   const [slides, setSlides] = useState<CarouselSlide[]>([]);
@@ -68,6 +84,13 @@ export function AdminPanel({ token, onStoreDataChanged }: AdminPanelProps) {
   const [adminRoulette, setAdminRoulette] = useState<AdminRouletteResponse | null>(null);
 
   const [statusFilter, setStatusFilter] = useState<string>('Todos');
+  const [newCourier, setNewCourier] = useState({
+    name: '',
+    email: '',
+    whatsapp: '',
+    password: '',
+  });
+  const [savingCourier, setSavingCourier] = useState(false);
 
   const [editingProduct, setEditingProduct] = useState<{
     id?: number;
@@ -79,6 +102,8 @@ export function AdminPanel({ token, onStoreDataChanged }: AdminPanelProps) {
     variationsText: string;
     active: boolean;
   } | null>(null);
+  const [uploadingProductImage, setUploadingProductImage] = useState(false);
+  const productFileInputRef = useRef<HTMLInputElement | null>(null);
 
   const [editingCoupon, setEditingCoupon] = useState<{
     id?: number;
@@ -100,6 +125,8 @@ export function AdminPanel({ token, onStoreDataChanged }: AdminPanelProps) {
     sortOrder: string;
     active: boolean;
   } | null>(null);
+  const [uploadingSlideImage, setUploadingSlideImage] = useState(false);
+  const slideFileInputRef = useRef<HTMLInputElement | null>(null);
 
   const [editingPrize, setEditingPrize] = useState<{
     id: number;
@@ -111,8 +138,8 @@ export function AdminPanel({ token, onStoreDataChanged }: AdminPanelProps) {
     active: boolean;
   } | null>(null);
 
-  async function loadOverview() {
-    setLoading(true);
+  async function loadOverview(silent = false) {
+    if (!silent) setLoading(true);
     setError('');
     try {
       const [data, rouletteData] = await Promise.all([
@@ -120,21 +147,30 @@ export function AdminPanel({ token, onStoreDataChanged }: AdminPanelProps) {
         api.getAdminRoulette(token),
       ]);
       setOrders(data.orders);
+      setCouriers(data.couriers || []);
       setProducts(data.products);
       setCoupons(data.coupons);
       setSlides(data.slides);
       setSettings(data.settings);
       setAdminRoulette(rouletteData);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Erro ao carregar painel administrativo.');
+      if (!silent) {
+        setError(err instanceof Error ? err.message : 'Erro ao carregar painel administrativo.');
+      }
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }
 
   useEffect(() => {
-    void loadOverview();
+    void loadOverview(false);
   }, [token]);
+
+  useEffect(() => {
+    if (liveSyncTrigger > 0) {
+      void loadOverview(true);
+    }
+  }, [liveSyncTrigger]);
 
   function showNotice(msg: string) {
     setFeedback(msg);
@@ -175,6 +211,76 @@ export function AdminPanel({ token, onStoreDataChanged }: AdminPanelProps) {
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Erro ao atualizar status.');
+    }
+  }
+
+  async function handleAssignCourier(orderId: number, courierIdValue: string) {
+    setError('');
+    try {
+      const courierId = courierIdValue ? Number(courierIdValue) : null;
+      const res = await api.assignOrderCourier(token, orderId, courierId);
+      setOrders((prev) => prev.map((o) => (o.id === orderId ? res.order : o)));
+      showNotice(
+        res.order.assignedCourierName
+          ? `Motoboy ${res.order.assignedCourierName} atribuído ao Pedido #${res.order.orderNumber}.`
+          : `Motoboy removido do Pedido #${res.order.orderNumber}.`
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Erro ao atribuir motoboy.');
+    }
+  }
+
+  async function handleCreateCourier(e: FormEvent) {
+    e.preventDefault();
+    setError('');
+    setSavingCourier(true);
+    try {
+      const res = await api.createAdminCourier(token, {
+        name: newCourier.name.trim(),
+        email: newCourier.email.trim(),
+        whatsapp: newCourier.whatsapp.trim(),
+        password: newCourier.password,
+      });
+      setCouriers((prev) => [res.courier, ...prev]);
+      setNewCourier({ name: '', email: '', whatsapp: '', password: '' });
+      showNotice(`Motoboy ${res.courier.name} cadastrado com sucesso.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Erro ao cadastrar motoboy.');
+    } finally {
+      setSavingCourier(false);
+    }
+  }
+
+  async function handleToggleCourierActive(courier: CourierSummary) {
+    setError('');
+    try {
+      const res = await api.toggleCourierActive(token, courier.id, !courier.active);
+      setCouriers((prev) => prev.map((c) => (c.id === courier.id ? res.courier : c)));
+      showNotice(
+        res.courier.active
+          ? `Motoboy ${res.courier.name} reativado.`
+          : `Motoboy ${res.courier.name} desativado.`
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Erro ao atualizar motoboy.');
+    }
+  }
+
+  async function handleProductFileSelected(e: ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file || !editingProduct) return;
+    setError('');
+    setUploadingProductImage(true);
+    try {
+      const dataUrl = await compressImageFileToDataUrl(file);
+      const res = await api.uploadAdminImage(token, dataUrl);
+      setEditingProduct((prev) => (prev ? { ...prev, imageUrl: res.imageUrl } : prev));
+      showNotice('Foto do celular carregada no produto. Clique em "Salvar Produto" para publicar.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Erro ao enviar foto do produto.');
+    } finally {
+      setUploadingProductImage(false);
     }
   }
 
@@ -246,6 +352,24 @@ export function AdminPanel({ token, onStoreDataChanged }: AdminPanelProps) {
       showNotice('Cupom removido.');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Erro ao remover cupom.');
+    }
+  }
+
+  async function handleSlideFileSelected(e: ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file || !editingSlide) return;
+    setError('');
+    setUploadingSlideImage(true);
+    try {
+      const dataUrl = await compressImageFileToDataUrl(file);
+      const res = await api.uploadAdminImage(token, dataUrl);
+      setEditingSlide((prev) => (prev ? { ...prev, imageUrl: res.imageUrl } : prev));
+      showNotice('Foto do celular carregada no slide. Clique em "Salvar Slide" para publicar.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Erro ao enviar foto do slide.');
+    } finally {
+      setUploadingSlideImage(false);
     }
   }
 
@@ -394,6 +518,7 @@ export function AdminPanel({ token, onStoreDataChanged }: AdminPanelProps) {
       <div className="flex items-center gap-2 overflow-x-auto pb-1">
         {[
           { id: 'orders', label: `Pedidos (${orders.length})`, icon: ClipboardList },
+          { id: 'couriers', label: `Motoboys (${couriers.length})`, icon: Bike },
           { id: 'products', label: `Produtos (${products.length})`, icon: Package },
           { id: 'coupons', label: `Cupons (${coupons.length})`, icon: Tag },
           { id: 'carousel', label: `Carrossel (${slides.length})`, icon: Layers },
@@ -480,24 +605,78 @@ export function AdminPanel({ token, onStoreDataChanged }: AdminPanelProps) {
                           </p>
                         </div>
 
-                        <div className="flex items-center gap-2">
-                          <label className="text-xs text-[#9E9E9E]" htmlFor={`status-${order.id}`}>
-                            Status:
-                          </label>
-                          <select
-                            id={`status-${order.id}`}
-                            value={order.status}
-                            onChange={(e) => handleOrderStatusChange(order.id, e.target.value as OrderStatus)}
-                            className="h-9 px-3 rounded-xl bg-black border border-white/20 text-xs font-bold text-white focus:outline-none focus:border-white"
-                          >
-                            {ORDER_STATUSES.map((st) => (
-                              <option key={st} value={st}>
-                                {st}
-                              </option>
-                            ))}
-                          </select>
+                        <div className="flex flex-wrap items-center gap-2.5">
+                          {order.deliveryMethod === 'Entrega' && (
+                            <div className="flex items-center gap-1.5">
+                              <label className="text-xs text-[#9E9E9E]" htmlFor={`courier-${order.id}`}>
+                                Motoboy:
+                              </label>
+                              <select
+                                id={`courier-${order.id}`}
+                                value={order.assignedCourierId ?? ''}
+                                onChange={(e) => void handleAssignCourier(order.id, e.target.value)}
+                                className="h-9 px-3 rounded-xl bg-black border border-white/20 text-xs font-semibold text-white focus:outline-none focus:border-white"
+                              >
+                                <option value="">Sem motoboy</option>
+                                {couriers
+                                  .filter((c) => c.active || c.id === order.assignedCourierId)
+                                  .map((c) => (
+                                    <option key={c.id} value={c.id}>
+                                      {c.name}
+                                    </option>
+                                  ))}
+                              </select>
+                            </div>
+                          )}
+
+                          <div className="flex items-center gap-1.5">
+                            <label className="text-xs text-[#9E9E9E]" htmlFor={`status-${order.id}`}>
+                              Status:
+                            </label>
+                            <select
+                              id={`status-${order.id}`}
+                              value={order.status}
+                              onChange={(e) => handleOrderStatusChange(order.id, e.target.value as OrderStatus)}
+                              className="h-9 px-3 rounded-xl bg-black border border-white/20 text-xs font-bold text-white focus:outline-none focus:border-white"
+                            >
+                              {ORDER_STATUSES.map((st) => (
+                                <option key={st} value={st}>
+                                  {st}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+
+                          {isTrackingAvailableForOrder(order) && (
+                            <button
+                              type="button"
+                              onClick={() => onOpenTracking(order.id)}
+                              className="h-9 px-3 rounded-xl bg-white text-black text-xs font-extrabold inline-flex items-center gap-1.5 hover:bg-neutral-200 transition-colors"
+                            >
+                              <MapPin className="w-3.5 h-3.5" />
+                              Ver Mapa
+                            </button>
+                          )}
                         </div>
                       </div>
+
+                      {order.deliveryMethod === 'Entrega' && isTrackingAvailableForOrder(order) && (
+                        <div className="rounded-xl bg-black border border-white/15 px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs">
+                          <span className="text-[#E5E5E5]">
+                            Rastreamento ativo ·{' '}
+                            <strong className="text-white">
+                              {order.courierGpsStatus === 'active'
+                                ? 'GPS em tempo real'
+                                : order.courierGpsStatus === 'unavailable'
+                                  ? 'GPS do motoboy indisponível'
+                                  : 'Aguardando motoboy ativar GPS'}
+                            </strong>
+                          </span>
+                          {order.assignedCourierName && (
+                            <span className="text-[#9E9E9E]">Entregador: {order.assignedCourierName}</span>
+                          )}
+                        </div>
+                      )}
 
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
                         <div className="space-y-1">
@@ -566,6 +745,140 @@ export function AdminPanel({ token, onStoreDataChanged }: AdminPanelProps) {
                           Total: {formatBRL(order.total)}
                         </span>
                       </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* COURIERS (MOTOBOYS) TAB */}
+          {tab === 'couriers' && (
+            <div className="space-y-6">
+              <div>
+                <h2 className="text-lg font-extrabold text-white">Equipe de Motoboys</h2>
+                <p className="text-xs text-[#9E9E9E] mt-0.5">
+                  Cadastre os motoboys para que eles façam login, compartilhem a localização GPS e concluam entregas
+                  atribuídas.
+                </p>
+              </div>
+
+              <form
+                onSubmit={handleCreateCourier}
+                className="rounded-3xl border border-white/15 bg-[#0C0C0C] p-5 sm:p-6 space-y-4"
+              >
+                <div className="flex items-center gap-2">
+                  <UserPlus className="w-4 h-4 text-white" />
+                  <h3 className="text-base font-extrabold text-white">Cadastrar Novo Motoboy</h3>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
+                  <div>
+                    <label htmlFor="courier-name" className="block text-xs font-semibold text-[#E5E5E5] mb-1">
+                      Nome completo *
+                    </label>
+                    <input
+                      id="courier-name"
+                      type="text"
+                      required
+                      value={newCourier.name}
+                      onChange={(e) => setNewCourier({ ...newCourier, name: e.target.value })}
+                      placeholder="Ex: Lucas Entregas"
+                      className="w-full h-11 px-3.5 rounded-xl bg-black border border-white/15 text-sm text-white focus:outline-none focus:border-white"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="courier-email" className="block text-xs font-semibold text-[#E5E5E5] mb-1">
+                      E-mail de acesso *
+                    </label>
+                    <input
+                      id="courier-email"
+                      type="email"
+                      required
+                      value={newCourier.email}
+                      onChange={(e) => setNewCourier({ ...newCourier, email: e.target.value })}
+                      placeholder="motoboy@rptabacaria.com"
+                      className="w-full h-11 px-3.5 rounded-xl bg-black border border-white/15 text-sm text-white focus:outline-none focus:border-white"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="courier-whatsapp" className="block text-xs font-semibold text-[#E5E5E5] mb-1">
+                      WhatsApp
+                    </label>
+                    <input
+                      id="courier-whatsapp"
+                      type="tel"
+                      value={newCourier.whatsapp}
+                      onChange={(e) =>
+                        setNewCourier({ ...newCourier, whatsapp: formatWhatsappInput(e.target.value) })
+                      }
+                      placeholder="(11) 99999-9999"
+                      className="w-full h-11 px-3.5 rounded-xl bg-black border border-white/15 text-sm text-white tabular-nums focus:outline-none focus:border-white"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="courier-password" className="block text-xs font-semibold text-[#E5E5E5] mb-1">
+                      Senha inicial (mín. 6) *
+                    </label>
+                    <input
+                      id="courier-password"
+                      type="password"
+                      required
+                      minLength={6}
+                      value={newCourier.password}
+                      onChange={(e) => setNewCourier({ ...newCourier, password: e.target.value })}
+                      placeholder="******"
+                      className="w-full h-11 px-3.5 rounded-xl bg-black border border-white/15 text-sm text-white focus:outline-none focus:border-white"
+                    />
+                  </div>
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={savingCourier}
+                  className="h-11 px-6 rounded-xl bg-white text-black font-extrabold text-xs sm:text-sm hover:bg-neutral-200 transition-colors disabled:opacity-50"
+                >
+                  {savingCourier ? 'Cadastrando...' : 'Cadastrar Motoboy'}
+                </button>
+              </form>
+
+              {couriers.length === 0 ? (
+                <div className="rounded-3xl border border-white/12 bg-[#0C0C0C] p-10 text-center text-sm text-[#9E9E9E]">
+                  Nenhum motoboy cadastrado ainda.
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {couriers.map((courier) => (
+                    <div
+                      key={courier.id}
+                      className="rounded-2xl border border-white/12 bg-[#0C0C0C] p-4 sm:p-5 flex items-center justify-between gap-4"
+                    >
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <p className="text-base font-bold text-white truncate">{courier.name}</p>
+                          <span
+                            className={`px-2 py-0.5 rounded text-[11px] font-bold ${
+                              courier.active
+                                ? 'bg-emerald-500/20 text-emerald-300'
+                                : 'bg-red-500/20 text-red-300'
+                            }`}
+                          >
+                            {courier.active ? 'Ativo' : 'Desativado'}
+                          </span>
+                        </div>
+                        <p className="text-xs text-[#9E9E9E] truncate mt-0.5">{courier.email}</p>
+                        {courier.whatsapp && (
+                          <p className="text-xs text-[#E5E5E5] tabular-nums mt-0.5">{courier.whatsapp}</p>
+                        )}
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() => void handleToggleCourierActive(courier)}
+                        className="h-9 px-3.5 rounded-xl border border-white/15 text-xs font-bold text-white hover:bg-white hover:text-black transition-colors shrink-0"
+                      >
+                        {courier.active ? 'Desativar' : 'Reativar'}
+                      </button>
                     </div>
                   ))}
                 </div>
@@ -673,15 +986,39 @@ export function AdminPanel({ token, onStoreDataChanged }: AdminPanelProps) {
                         className="w-full p-3.5 rounded-xl bg-black border border-white/15 text-sm text-white focus:outline-none focus:border-white resize-none"
                       />
                     </div>
-                    <div className="sm:col-span-3 space-y-2">
-                      <label className="block text-xs font-semibold text-[#E5E5E5]">URL da Imagem</label>
+                    <div className="sm:col-span-3 space-y-3">
+                      <label className="block text-xs font-semibold text-[#E5E5E5]">
+                        Foto do produto (escolha do celular, cole uma URL ou selecione um modelo)
+                      </label>
+
                       <input
-                        type="text"
-                        value={editingProduct.imageUrl}
-                        onChange={(e) => setEditingProduct({ ...editingProduct, imageUrl: e.target.value })}
-                        placeholder="https://... ou escolha um modelo abaixo"
-                        className="w-full h-11 px-4 rounded-xl bg-black border border-white/15 text-sm text-white focus:outline-none focus:border-white"
+                        ref={productFileInputRef}
+                        type="file"
+                        accept="image/*"
+                        onChange={(e) => void handleProductFileSelected(e)}
+                        className="hidden"
                       />
+
+                      <div className="flex flex-col sm:flex-row gap-2.5">
+                        <button
+                          type="button"
+                          disabled={uploadingProductImage}
+                          onClick={() => productFileInputRef.current?.click()}
+                          className="inline-flex items-center justify-center gap-2 min-h-11 px-4 py-2.5 rounded-xl bg-white text-black font-bold text-xs sm:text-sm hover:bg-neutral-200 disabled:opacity-50 transition-colors shrink-0"
+                        >
+                          <ImagePlus className="w-4 h-4" />
+                          {uploadingProductImage ? 'Enviando foto...' : 'Escolher foto do celular'}
+                        </button>
+
+                        <input
+                          type="text"
+                          value={editingProduct.imageUrl}
+                          onChange={(e) => setEditingProduct({ ...editingProduct, imageUrl: e.target.value })}
+                          placeholder="https://... ou escolha um modelo abaixo"
+                          className="flex-1 h-11 px-4 rounded-xl bg-black border border-white/15 text-sm text-white focus:outline-none focus:border-white"
+                        />
+                      </div>
+
                       <div className="flex flex-wrap gap-2">
                         {PRESET_IMAGES.map((img) => (
                           <button
@@ -694,6 +1031,32 @@ export function AdminPanel({ token, onStoreDataChanged }: AdminPanelProps) {
                           </button>
                         ))}
                       </div>
+
+                      {editingProduct.imageUrl && (
+                        <div className="flex items-center justify-between gap-4 p-3 rounded-2xl border border-white/15 bg-black">
+                          <div className="flex items-center gap-3 min-w-0">
+                            <div className="w-16 h-16 rounded-xl overflow-hidden bg-[#141414] border border-white/10 shrink-0">
+                              <SafeProductImage
+                                src={editingProduct.imageUrl}
+                                alt={editingProduct.name || 'Prévia do produto'}
+                                className="w-full h-full object-cover"
+                              />
+                            </div>
+                            <div className="min-w-0">
+                              <p className="text-xs font-semibold text-white">Prévia da foto do produto</p>
+                              <p className="text-[11px] text-[#9E9E9E] truncate">{editingProduct.imageUrl}</p>
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => setEditingProduct({ ...editingProduct, imageUrl: '' })}
+                            className="inline-flex items-center gap-1 h-8 px-3 rounded-lg bg-[#111111] border border-white/20 text-xs font-semibold text-white hover:bg-white hover:text-black transition-colors shrink-0"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                            Remover foto
+                          </button>
+                        </div>
+                      )}
                     </div>
                   </div>
 
@@ -717,7 +1080,8 @@ export function AdminPanel({ token, onStoreDataChanged }: AdminPanelProps) {
                     </button>
                     <button
                       type="submit"
-                      className="h-10 px-6 rounded-xl bg-white text-black text-sm font-bold hover:bg-neutral-200"
+                      disabled={uploadingProductImage}
+                      className="h-10 px-6 rounded-xl bg-white text-black text-sm font-bold hover:bg-neutral-200 disabled:opacity-50"
                     >
                       Salvar Produto
                     </button>
@@ -988,11 +1352,11 @@ export function AdminPanel({ token, onStoreDataChanged }: AdminPanelProps) {
           {/* CAROUSEL TAB */}
           {tab === 'carousel' && (
             <div className="space-y-5">
-              <div className="flex justify-between items-center">
+              <div className="flex justify-between items-center gap-3">
                 <div>
                   <h2 className="text-lg font-bold text-white">Carrossel da Página Inicial</h2>
                   <p className="text-xs text-[#9E9E9E]">
-                    Por padrão os slides são exibidos sem foto, com foco na tipografia R&amp;P.
+                    Personalize os destaques com texto ou escolha fotos direto da galeria do celular.
                   </p>
                 </div>
                 <button
@@ -1009,7 +1373,7 @@ export function AdminPanel({ token, onStoreDataChanged }: AdminPanelProps) {
                       active: true,
                     })
                   }
-                  className="inline-flex items-center gap-2 h-10 px-4 rounded-xl bg-white text-black font-bold text-xs sm:text-sm hover:bg-neutral-200 transition-colors"
+                  className="inline-flex items-center gap-2 h-10 px-4 rounded-xl bg-white text-black font-bold text-xs sm:text-sm hover:bg-neutral-200 transition-colors whitespace-nowrap shrink-0"
                 >
                   <Plus className="w-4 h-4" />
                   Novo Slide
@@ -1092,17 +1456,61 @@ export function AdminPanel({ token, onStoreDataChanged }: AdminPanelProps) {
                         className="w-full h-11 px-4 rounded-xl bg-black border border-white/15 text-sm text-white focus:outline-none focus:border-white"
                       />
                     </div>
-                    <div className="sm:col-span-2">
-                      <label className="block text-xs font-semibold text-[#E5E5E5] mb-1">
-                        URL da foto (opcional — deixe em branco para manter sem foto)
+                    <div className="sm:col-span-2 space-y-3">
+                      <label className="block text-xs font-semibold text-[#E5E5E5]">
+                        Foto do slide (opcional — envie direto do celular ou informe uma URL)
                       </label>
+
                       <input
-                        type="text"
-                        value={editingSlide.imageUrl}
-                        onChange={(e) => setEditingSlide({ ...editingSlide, imageUrl: e.target.value })}
-                        placeholder="Vazio (sem foto)"
-                        className="w-full h-11 px-4 rounded-xl bg-black border border-white/15 text-sm text-white focus:outline-none focus:border-white"
+                        ref={slideFileInputRef}
+                        type="file"
+                        accept="image/*"
+                        onChange={(e) => void handleSlideFileSelected(e)}
+                        className="hidden"
                       />
+
+                      <div className="flex flex-col sm:flex-row gap-2.5">
+                        <button
+                          type="button"
+                          disabled={uploadingSlideImage}
+                          onClick={() => slideFileInputRef.current?.click()}
+                          className="inline-flex items-center justify-center gap-2 min-h-11 px-4 py-2.5 rounded-xl bg-white text-black font-bold text-xs sm:text-sm hover:bg-neutral-200 disabled:opacity-50 transition-colors shrink-0"
+                        >
+                          <ImagePlus className="w-4 h-4" />
+                          {uploadingSlideImage ? 'Enviando foto...' : 'Escolher foto do celular'}
+                        </button>
+
+                        <input
+                          type="text"
+                          value={editingSlide.imageUrl}
+                          onChange={(e) => setEditingSlide({ ...editingSlide, imageUrl: e.target.value })}
+                          placeholder="Ou cole o link da imagem (opcional)"
+                          className="flex-1 h-11 px-4 rounded-xl bg-black border border-white/15 text-sm text-white focus:outline-none focus:border-white"
+                        />
+                      </div>
+
+                      {editingSlide.imageUrl && (
+                        <div className="relative rounded-2xl overflow-hidden border border-white/15 bg-black">
+                          <img
+                            src={editingSlide.imageUrl}
+                            alt="Pré-visualização do slide"
+                            className="w-full h-36 sm:h-44 object-cover opacity-75"
+                          />
+                          <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent flex items-end justify-between p-3">
+                            <span className="text-[11px] font-semibold text-white/90">
+                              Prévia da foto no carrossel
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => setEditingSlide({ ...editingSlide, imageUrl: '' })}
+                              className="inline-flex items-center gap-1 h-8 px-3 rounded-lg bg-black/80 border border-white/25 text-xs font-semibold text-white hover:bg-white hover:text-black transition-colors"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                              Remover foto
+                            </button>
+                          </div>
+                        </div>
+                      )}
                     </div>
                   </div>
 
@@ -1140,12 +1548,21 @@ export function AdminPanel({ token, onStoreDataChanged }: AdminPanelProps) {
                     key={s.id}
                     className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-4 rounded-2xl border border-white/12 bg-[#0C0C0C]"
                   >
-                    <div className="space-y-1">
-                      <p className="text-xs text-[#9E9E9E]">
-                        Ordem {s.sortOrder} · {s.active ? 'Ativo' : 'Oculto'} · Botão: {s.ctaText} ({s.targetCategory})
-                      </p>
-                      <h3 className="text-base font-bold text-white">{s.title}</h3>
-                      {s.subtitle && <p className="text-xs text-[#9E9E9E]">{s.subtitle}</p>}
+                    <div className="flex items-center gap-3.5 min-w-0">
+                      {s.imageUrl && (
+                        <img
+                          src={s.imageUrl}
+                          alt={s.title}
+                          className="w-16 h-12 rounded-xl object-cover border border-white/15 shrink-0 bg-black"
+                        />
+                      )}
+                      <div className="space-y-1 min-w-0">
+                        <p className="text-xs text-[#9E9E9E]">
+                          Ordem {s.sortOrder} · {s.active ? 'Ativo' : 'Oculto'} · Botão: {s.ctaText} ({s.targetCategory})
+                        </p>
+                        <h3 className="text-base font-bold text-white truncate">{s.title}</h3>
+                        {s.subtitle && <p className="text-xs text-[#9E9E9E] truncate">{s.subtitle}</p>}
+                      </div>
                     </div>
 
                     <div className="flex items-center gap-2 shrink-0">
