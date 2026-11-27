@@ -3,8 +3,11 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type {
   CarouselSlide,
+  CourierGpsStatus,
+  CourierSummary,
   Coupon,
   DeliveryAddress,
+  DeliveryTrackingInfo,
   Order,
   OrderStatus,
   Product,
@@ -37,6 +40,7 @@ db.exec(`
     addressJson TEXT,
     passwordHash TEXT NOT NULL,
     role TEXT NOT NULL DEFAULT 'customer',
+    active INTEGER NOT NULL DEFAULT 1,
     createdAt TEXT NOT NULL
   );
 
@@ -164,6 +168,30 @@ db.exec(`
     createdAt TEXT NOT NULL,
     FOREIGN KEY (userId) REFERENCES users(id)
   );
+
+  CREATE TABLE IF NOT EXISTS delivery_tracking_points (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    orderId INTEGER NOT NULL,
+    courierId INTEGER NOT NULL,
+    lat REAL NOT NULL,
+    lng REAL NOT NULL,
+    accuracy REAL,
+    heading REAL,
+    speed REAL,
+    recordedAt TEXT NOT NULL,
+    FOREIGN KEY (orderId) REFERENCES orders(id),
+    FOREIGN KEY (courierId) REFERENCES users(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS password_reset_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    userId INTEGER NOT NULL,
+    tokenHash TEXT UNIQUE NOT NULL,
+    expiresAt TEXT NOT NULL,
+    usedAt TEXT,
+    createdAt TEXT NOT NULL,
+    FOREIGN KEY (userId) REFERENCES users(id)
+  );
 `);
 
 function ensureColumn(table: string, column: string, definition: string): void {
@@ -192,6 +220,20 @@ ensureColumn(
 ensureColumn('store_settings', 'shippingPerKm', 'REAL NOT NULL DEFAULT 1.5');
 ensureColumn('store_settings', 'freeShippingKm', 'REAL NOT NULL DEFAULT 1.5');
 ensureColumn('store_settings', 'storeCep', "TEXT NOT NULL DEFAULT '01001-000'");
+ensureColumn('users', 'active', 'INTEGER NOT NULL DEFAULT 1');
+ensureColumn('orders', 'destLat', 'REAL');
+ensureColumn('orders', 'destLng', 'REAL');
+ensureColumn('orders', 'assignedCourierId', 'INTEGER');
+ensureColumn('orders', 'assignedCourierName', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('orders', 'trackingActive', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('orders', 'courierLat', 'REAL');
+ensureColumn('orders', 'courierLng', 'REAL');
+ensureColumn('orders', 'courierAccuracy', 'REAL');
+ensureColumn('orders', 'courierHeading', 'REAL');
+ensureColumn('orders', 'courierSpeed', 'REAL');
+ensureColumn('orders', 'courierGpsStatus', "TEXT NOT NULL DEFAULT 'waiting'");
+ensureColumn('orders', 'lastLocationAt', 'TEXT');
+ensureColumn('orders', 'deliveredAt', 'TEXT');
 ensureColumn('store_settings', 'storeLat', 'REAL NOT NULL DEFAULT -23.55052');
 ensureColumn('store_settings', 'storeLng', 'REAL NOT NULL DEFAULT -46.633308');
 
@@ -375,6 +417,8 @@ export function mapUserRow(row: Record<string, unknown>): User {
       savedAddress = null;
     }
   }
+  const rawRole = String(row.role || 'customer');
+  const role: UserRole = rawRole === 'admin' ? 'admin' : rawRole === 'courier' ? 'courier' : 'customer';
   return {
     id: Number(row.id),
     name: String(row.name),
@@ -382,7 +426,8 @@ export function mapUserRow(row: Record<string, unknown>): User {
     whatsapp: String(row.whatsapp || ''),
     cpf: String(row.cpf || ''),
     savedAddress,
-    role: row.role === 'admin' ? 'admin' : 'customer',
+    role,
+    active: row.active !== 0,
     createdAt: String(row.createdAt),
   };
 }
@@ -488,6 +533,18 @@ export function mapOrderRow(row: Record<string, unknown>): Order {
   } catch {
     items = [];
   }
+  const rawGpsStatus = String(row.courierGpsStatus || 'waiting');
+  const courierGpsStatus: CourierGpsStatus =
+    rawGpsStatus === 'active' || rawGpsStatus === 'unavailable' || rawGpsStatus === 'ended'
+      ? rawGpsStatus
+      : 'waiting';
+  const destLat = row.destLat !== null && row.destLat !== undefined ? Number(row.destLat) : null;
+  const destLng = row.destLng !== null && row.destLng !== undefined ? Number(row.destLng) : null;
+  const destCoords =
+    destLat !== null && destLng !== null && Number.isFinite(destLat) && Number.isFinite(destLng)
+      ? { lat: destLat, lng: destLng }
+      : null;
+
   return {
     id: Number(row.id),
     orderNumber: Number(row.orderNumber),
@@ -511,6 +568,57 @@ export function mapOrderRow(row: Record<string, unknown>): Order {
     rouletteGranted: Boolean(row.rouletteGranted),
     notes: String(row.notes || ''),
     createdAt: String(row.createdAt),
+    assignedCourierId:
+      row.assignedCourierId !== null && row.assignedCourierId !== undefined
+        ? Number(row.assignedCourierId)
+        : null,
+    assignedCourierName: String(row.assignedCourierName || ''),
+    destCoords,
+    trackingActive: Boolean(row.trackingActive),
+    courierGpsStatus,
+    lastLocationAt: row.lastLocationAt ? String(row.lastLocationAt) : null,
+    deliveredAt: row.deliveredAt ? String(row.deliveredAt) : null,
+  };
+}
+
+export function mapDeliveryTrackingInfo(
+  row: Record<string, unknown>,
+  settings: StoreSettings
+): DeliveryTrackingInfo {
+  const order = mapOrderRow(row);
+  const courierLat = row.courierLat !== null && row.courierLat !== undefined ? Number(row.courierLat) : null;
+  const courierLng = row.courierLng !== null && row.courierLng !== undefined ? Number(row.courierLng) : null;
+  const courierCoords =
+    courierLat !== null &&
+    courierLng !== null &&
+    Number.isFinite(courierLat) &&
+    Number.isFinite(courierLng)
+      ? { lat: courierLat, lng: courierLng }
+      : null;
+
+  return {
+    orderId: order.id,
+    orderNumber: order.orderNumber,
+    status: order.status,
+    deliveryMethod: order.deliveryMethod,
+    customerName: order.customerName,
+    address: order.address,
+    destCoords: order.destCoords,
+    storeCoords: { lat: settings.storeLat, lng: settings.storeLng },
+    storeAddress: settings.storeAddress,
+    assignedCourierId: order.assignedCourierId,
+    assignedCourierName: order.assignedCourierName,
+    trackingActive: order.trackingActive,
+    courierCoords,
+    courierAccuracy:
+      row.courierAccuracy !== null && row.courierAccuracy !== undefined ? Number(row.courierAccuracy) : null,
+    courierHeading:
+      row.courierHeading !== null && row.courierHeading !== undefined ? Number(row.courierHeading) : null,
+    courierSpeed:
+      row.courierSpeed !== null && row.courierSpeed !== undefined ? Number(row.courierSpeed) : null,
+    courierGpsStatus: order.courierGpsStatus,
+    lastLocationAt: order.lastLocationAt,
+    deliveredAt: order.deliveredAt,
   };
 }
 
@@ -561,7 +669,7 @@ export type UserRecord = User & { passwordHash: string };
 export function getUserByEmail(email: string): UserRecord | null {
   const row = db
     .prepare(
-      'SELECT id, name, email, whatsapp, cpf, addressJson, passwordHash, role, createdAt FROM users WHERE lower(email) = lower(?)'
+      'SELECT id, name, email, whatsapp, cpf, addressJson, passwordHash, role, active, createdAt FROM users WHERE lower(email) = lower(?)'
     )
     .get(email.trim()) as Record<string, unknown> | undefined;
   if (!row) return null;
@@ -573,9 +681,25 @@ export function getUserByEmail(email: string): UserRecord | null {
 
 export function getUserById(id: number): User | null {
   const row = db
-    .prepare('SELECT id, name, email, whatsapp, cpf, addressJson, role, createdAt FROM users WHERE id = ?')
+    .prepare('SELECT id, name, email, whatsapp, cpf, addressJson, role, active, createdAt FROM users WHERE id = ?')
     .get(id) as Record<string, unknown> | undefined;
   return row ? mapUserRow(row) : null;
+}
+
+export function listCouriers(): CourierSummary[] {
+  const rows = db
+    .prepare(
+      "SELECT id, name, email, whatsapp, active, createdAt FROM users WHERE role = 'courier' ORDER BY id DESC"
+    )
+    .all() as Record<string, unknown>[];
+  return rows.map((row) => ({
+    id: Number(row.id),
+    name: String(row.name),
+    email: String(row.email),
+    whatsapp: String(row.whatsapp || ''),
+    active: row.active !== 0,
+    createdAt: String(row.createdAt),
+  }));
 }
 
 export function hasAdminUser(): boolean {
@@ -592,7 +716,7 @@ export function createUserRecord(params: {
 }): User {
   const now = new Date().toISOString();
   const res = db
-    .prepare('INSERT INTO users (name, email, whatsapp, passwordHash, role, createdAt) VALUES (?, ?, ?, ?, ?, ?)')
+    .prepare('INSERT INTO users (name, email, whatsapp, passwordHash, role, active, createdAt) VALUES (?, ?, ?, ?, ?, 1, ?)')
     .run(params.name, params.email.trim().toLowerCase(), params.whatsapp, params.passwordHash, params.role, now);
   const created = getUserById(Number(res.lastInsertRowid));
   if (!created) {
