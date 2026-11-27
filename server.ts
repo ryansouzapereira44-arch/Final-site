@@ -1,5 +1,7 @@
 import 'dotenv/config';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import express, { type Response } from 'express';
 import { createServer as createViteServer } from 'vite';
@@ -9,8 +11,10 @@ import {
   getUserByEmail,
   getUserById,
   hasAdminUser,
+  listCouriers,
   mapChanceRow,
   mapCouponRow,
+  mapDeliveryTrackingInfo,
   mapOrderRow,
   mapPrizeRow,
   mapProductRow,
@@ -23,15 +27,19 @@ import {
   clearSessionCookie,
   getAdminEmail,
   getConfiguredAdminPassword,
+  getOptionalAuthUser,
   hashPassword,
   isAdminClaimed,
   requireAdmin,
   requireAuth,
+  requireCourier,
   setSessionCookie,
   signSessionToken,
   verifyEnvAdminPassword,
   verifyPassword,
 } from './server/auth.ts';
+import { sendPasswordResetEmail } from './server/mailer.ts';
+import { validateGpsCoordinates } from './src/lib/tracking.ts';
 import type {
   CartItem,
   Coordinates,
@@ -48,6 +56,7 @@ const VALID_ORDER_STATUSES: OrderStatus[] = [
   'Confirmado',
   'Em preparo',
   'Saiu para entrega',
+  'Entregue',
   'Pronto para retirada',
   'Concluído',
   'Cancelado',
@@ -68,8 +77,9 @@ function isSafeImageUrl(url: string): boolean {
   }
 }
 
-// SSE client registry per userId for real-time roulette & order updates
+// SSE client registry per userId for real-time roulette, order & delivery tracking updates
 const sseClients = new Map<number, Set<Response>>();
+const sseAdminUserIds = new Set<number>();
 
 function pushUserEvent(userId: number, eventName: string, payload: unknown): void {
   const clients = sseClients.get(userId);
@@ -81,6 +91,12 @@ function pushUserEvent(userId: number, eventName: string, payload: unknown): voi
     } catch {
       clients.delete(res);
     }
+  }
+}
+
+function pushAdminEvent(eventName: string, payload: unknown): void {
+  for (const adminId of sseAdminUserIds) {
+    pushUserEvent(adminId, eventName, payload);
   }
 }
 
@@ -203,6 +219,61 @@ async function lookupBrazilianCep(rawCep: string): Promise<CepLookupResult | nul
     cepMemoryCache.set(cleanCep, result);
   }
   return result;
+}
+
+async function geocodeDeliveryAddress(
+  address: DeliveryAddress | null,
+  fallbackCoords: Coordinates | null = null
+): Promise<Coordinates | null> {
+  if (address) {
+    const cepResult = address.cep ? await lookupBrazilianCep(address.cep) : null;
+    const parts = [
+      address.street || cepResult?.street || '',
+      address.number || '',
+      address.neighborhood || cepResult?.neighborhood || '',
+      cepResult?.city || '',
+      cepResult?.state || '',
+      address.cep || '',
+      'Brasil',
+    ]
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    // Free OpenStreetMap Nominatim geocoding (no API key or billing required)
+    if (parts.length > 0) {
+      try {
+        const url = new URL('https://nominatim.openstreetmap.org/search');
+        url.searchParams.set('format', 'jsonv2');
+        url.searchParams.set('countrycodes', 'br');
+        url.searchParams.set('limit', '1');
+        url.searchParams.set('q', parts.join(', '));
+        const geoRes = await fetch(url.toString(), {
+          headers: {
+            'Accept-Language': 'pt-BR',
+            'User-Agent': 'RPTabacaria-DeliveryTracker/1.0',
+          },
+          signal: AbortSignal.timeout(4500),
+        });
+        if (geoRes.ok) {
+          const data = (await geoRes.json()) as Array<{ lat?: string; lon?: string }>;
+          const first = data[0];
+          const valid = validateGpsCoordinates(Number(first?.lat), Number(first?.lon));
+          if (valid) {
+            return valid;
+          }
+        }
+      } catch {
+        // fallback below
+      }
+    }
+
+    if (cepResult && cepResult.lat !== 0 && cepResult.lng !== 0) {
+      const valid = validateGpsCoordinates(cepResult.lat, cepResult.lng);
+      if (valid) return valid;
+    }
+  }
+
+  return fallbackCoords ? validateGpsCoordinates(fallbackCoords.lat, fallbackCoords.lng) : null;
 }
 
 function haversineDistanceKm(a: Coordinates, b: Coordinates): number {
@@ -407,14 +478,67 @@ function generatePrizeCouponCode(prize: RoulettePrize): string {
 
 async function startServer(): Promise<void> {
   const app = express();
+  const httpServer = http.createServer(app);
   app.set('trust proxy', 1);
+
+  const uploadsDir = path.resolve(process.cwd(), 'data', 'uploads');
+  if (!fs.existsSync(uploadsDir)) {
+    fs.mkdirSync(uploadsDir, { recursive: true });
+  }
+  app.use('/uploads', express.static(uploadsDir, { maxAge: '7d' }));
+
+  // Admin image upload (validates raster image magic bytes and stores locally in data/uploads)
+  app.post(
+    '/api/admin/upload-image',
+    express.json({ limit: '6mb' }),
+    requireAuth,
+    requireAdmin,
+    (req, res) => {
+      const dataUrl = typeof req.body?.dataUrl === 'string' ? req.body.dataUrl.trim() : '';
+      const match = /^data:image\/(jpeg|jpg|png|webp);base64,([A-Za-z0-9+/=]+)$/.exec(dataUrl);
+      if (!match) {
+        res.status(400).json({ error: 'Formato de imagem inválido. Envie JPG, PNG ou WebP.' });
+        return;
+      }
+
+      const declaredType = match[1].toLowerCase();
+      const buffer = Buffer.from(match[2], 'base64');
+      if (buffer.length < 16 || buffer.length > 4 * 1024 * 1024) {
+        res.status(400).json({ error: 'A imagem deve ter no máximo 4 MB após otimização.' });
+        return;
+      }
+
+      const isJpeg = buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
+      const isPng =
+        buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47;
+      const isWebp =
+        buffer.subarray(0, 4).toString('ascii') === 'RIFF' &&
+        buffer.subarray(8, 12).toString('ascii') === 'WEBP';
+
+      let ext: 'jpg' | 'png' | 'webp' | null = null;
+      if ((declaredType === 'jpeg' || declaredType === 'jpg') && isJpeg) ext = 'jpg';
+      else if (declaredType === 'png' && isPng) ext = 'png';
+      else if (declaredType === 'webp' && isWebp) ext = 'webp';
+
+      if (!ext) {
+        res.status(400).json({ error: 'Arquivo de imagem corrompido ou não suportado.' });
+        return;
+      }
+
+      const filename = `slide-${Date.now()}-${crypto.randomBytes(6).toString('hex')}.${ext}`;
+      fs.writeFileSync(path.join(uploadsDir, filename), buffer);
+      res.status(201).json({ imageUrl: `/uploads/${filename}` });
+    }
+  );
+
   app.use(express.json({ limit: '1mb' }));
 
   // Auth status (public)
-  app.get('/api/auth/status', (_req, res) => {
+  app.get('/api/auth/status', (req, res) => {
     res.json({
       adminClaimed: isAdminClaimed(),
       adminEmail: getAdminEmail(),
+      user: getOptionalAuthUser(req),
     });
   });
 
@@ -507,11 +631,228 @@ async function startServer(): Promise<void> {
       res.status(401).json({ error: 'E-mail ou senha incorretos.' });
       return;
     }
+    if (record.active === false) {
+      res.status(403).json({ error: 'Sua conta foi desativada pelo administrador.' });
+      return;
+    }
 
     const { passwordHash: _ph, ...user } = record;
     const token = signSessionToken(user);
     setSessionCookie(res, token);
     res.json({ user, token });
+  });
+
+  // Password recovery rate limiter (per IP & email, max 5 requests per 15 min)
+  const forgotRateMap = new Map<string, number[]>();
+  function isForgotRateLimited(key: string): boolean {
+    const now = Date.now();
+    const windowMs = 15 * 60 * 1000;
+    const recent = (forgotRateMap.get(key) || []).filter((ts) => now - ts < windowMs);
+    if (recent.length >= 5) {
+      forgotRateMap.set(key, recent);
+      return true;
+    }
+    recent.push(now);
+    forgotRateMap.set(key, recent);
+    return false;
+  }
+
+  function hashResetToken(rawToken: string): string {
+    return crypto.createHash('sha256').update(rawToken).digest('hex');
+  }
+
+  function maskEmailHint(email: string): string {
+    const [local, domain] = email.split('@');
+    if (!local || !domain) return '***';
+    const prefix = local.slice(0, 2);
+    return `${prefix}${'*'.repeat(Math.max(2, local.length - 2))}@${domain}`;
+  }
+
+  function getPublicAppOrigin(req: express.Request): string {
+    const envUrl = (process.env.APP_URL || '').trim();
+    if (envUrl && /^https?:\/\//i.test(envUrl) && !envUrl.includes('MY_APP_URL')) {
+      return envUrl.replace(/\/+$/, '');
+    }
+    const rawHost = (req.get('x-forwarded-host') || req.get('host') || 'localhost:3000')
+      .split(',')[0]
+      .trim()
+      .replace(/[^a-zA-Z0-9.:-]/g, '');
+    const rawProto = (req.get('x-forwarded-proto') || req.protocol || 'https')
+      .split(',')[0]
+      .trim();
+    const proto = rawProto === 'http' ? 'http' : 'https';
+    return `${proto}://${rawHost || 'localhost:3000'}`;
+  }
+
+  // Request password recovery link
+  app.post('/api/auth/forgot-password', async (req, res) => {
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 160) {
+      res.status(400).json({ error: 'Informe um e-mail válido.' });
+      return;
+    }
+
+    const clientIp = (req.ip || 'unknown').slice(0, 64);
+    if (isForgotRateLimited(`ip:${clientIp}`) || isForgotRateLimited(`email:${email}`)) {
+      res.status(429).json({
+        error: 'Muitas solicitações recentes. Aguarde alguns minutos antes de tentar novamente.',
+      });
+      return;
+    }
+
+    const neutralResponse = {
+      ok: true,
+      message:
+        'Se o e-mail informado estiver cadastrado, enviaremos um link de recuperação para a sua caixa de entrada.',
+    };
+
+    const record = getUserByEmail(email);
+    const isEnvLockedAdmin = email === getAdminEmail() && Boolean(getConfiguredAdminPassword());
+    if (!record || record.active === false || isEnvLockedAdmin) {
+      res.json(neutralResponse);
+      return;
+    }
+
+    const rawToken = crypto.randomBytes(32).toString('hex');
+    const tokenHash = hashResetToken(rawToken);
+    const nowIso = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+
+    db.exec('BEGIN');
+    try {
+      db.prepare('UPDATE password_reset_tokens SET usedAt = ? WHERE userId = ? AND usedAt IS NULL').run(
+        nowIso,
+        record.id
+      );
+      db.prepare(
+        'INSERT INTO password_reset_tokens (userId, tokenHash, expiresAt, createdAt) VALUES (?, ?, ?, ?)'
+      ).run(record.id, tokenHash, expiresAt, nowIso);
+      db.exec('COMMIT');
+    } catch (err) {
+      try {
+        db.exec('ROLLBACK');
+      } catch {
+        // ignore
+      }
+      console.error('Forgot password token storage error:', err);
+      res.status(500).json({ error: 'Erro ao gerar solicitação de recuperação.' });
+      return;
+    }
+
+    const resetUrl = `${getPublicAppOrigin(req)}/?resetToken=${encodeURIComponent(rawToken)}`;
+    await sendPasswordResetEmail({
+      toEmail: record.email,
+      recipientName: record.name,
+      resetUrl,
+    });
+
+    res.json(neutralResponse);
+  });
+
+  // Validate password recovery token before showing new-password form
+  app.get('/api/auth/reset-password/validate', (req, res) => {
+    const rawToken = typeof req.query.token === 'string' ? req.query.token.trim() : '';
+    if (!/^[a-f0-9]{64}$/i.test(rawToken)) {
+      res.status(400).json({
+        valid: false,
+        error: 'Link de recuperação inválido ou expirado. Solicite um novo link.',
+      });
+      return;
+    }
+
+    const tokenHash = hashResetToken(rawToken);
+    const nowIso = new Date().toISOString();
+    const row = db
+      .prepare(
+        `SELECT t.id, t.expiresAt, t.usedAt, u.email, u.active
+         FROM password_reset_tokens t
+         JOIN users u ON u.id = t.userId
+         WHERE t.tokenHash = ?`
+      )
+      .get(tokenHash) as
+      | { id: number; expiresAt: string; usedAt: string | null; email: string; active: number }
+      | undefined;
+
+    if (!row || row.usedAt !== null || row.expiresAt <= nowIso || row.active === 0) {
+      res.status(400).json({
+        valid: false,
+        error: 'Link de recuperação inválido ou expirado. Solicite um novo link.',
+      });
+      return;
+    }
+
+    res.json({ valid: true, emailHint: maskEmailHint(row.email) });
+  });
+
+  // Reset password using validated single-use token
+  app.post('/api/auth/reset-password', (req, res) => {
+    const rawToken = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+    const confirmPassword =
+      typeof req.body?.confirmPassword === 'string' ? req.body.confirmPassword : '';
+
+    if (!/^[a-f0-9]{64}$/i.test(rawToken)) {
+      res.status(400).json({
+        error: 'Link de recuperação inválido ou expirado. Solicite um novo link.',
+      });
+      return;
+    }
+    if (password.length < 6 || password.length > 128) {
+      res.status(400).json({ error: 'A nova senha deve ter entre 6 e 128 caracteres.' });
+      return;
+    }
+    if (password !== confirmPassword) {
+      res.status(400).json({ error: 'A confirmação de senha não confere.' });
+      return;
+    }
+
+    const tokenHash = hashResetToken(rawToken);
+    const nowIso = new Date().toISOString();
+
+    db.exec('BEGIN');
+    try {
+      const row = db
+        .prepare(
+          `SELECT t.id, t.userId, t.expiresAt, t.usedAt, u.active
+           FROM password_reset_tokens t
+           JOIN users u ON u.id = t.userId
+           WHERE t.tokenHash = ?`
+        )
+        .get(tokenHash) as
+        | { id: number; userId: number; expiresAt: string; usedAt: string | null; active: number }
+        | undefined;
+
+      if (!row || row.usedAt !== null || row.expiresAt <= nowIso || row.active === 0) {
+        db.exec('ROLLBACK');
+        res.status(400).json({
+          error: 'Link de recuperação inválido ou expirado. Solicite um novo link.',
+        });
+        return;
+      }
+
+      const newHash = hashPassword(password);
+      db.prepare('UPDATE users SET passwordHash = ? WHERE id = ?').run(newHash, row.userId);
+      db.prepare('UPDATE password_reset_tokens SET usedAt = ? WHERE userId = ? AND usedAt IS NULL').run(
+        nowIso,
+        row.userId
+      );
+      db.exec('COMMIT');
+    } catch (err) {
+      try {
+        db.exec('ROLLBACK');
+      } catch {
+        // ignore
+      }
+      console.error('Reset password error:', err);
+      res.status(500).json({ error: 'Erro ao redefinir a senha. Tente novamente.' });
+      return;
+    }
+
+    clearSessionCookie(res);
+    res.json({
+      ok: true,
+      message: 'Senha alterada com sucesso! Agora você já pode entrar com a nova senha.',
+    });
   });
 
   // Logout
@@ -525,9 +866,10 @@ async function startServer(): Promise<void> {
     res.json({ user: req.authUser });
   });
 
-  // Real-time SSE notifications for automatic roulette & order status sync
+  // Real-time SSE notifications for automatic roulette, order status & delivery tracking sync
   app.get('/api/events', requireAuth, (req: AuthenticatedRequest, res) => {
-    const userId = req.authUser!.id;
+    const authUser = req.authUser!;
+    const userId = authUser.id;
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
@@ -537,6 +879,9 @@ async function startServer(): Promise<void> {
       sseClients.set(userId, new Set());
     }
     sseClients.get(userId)!.add(res);
+    if (authUser.role === 'admin') {
+      sseAdminUserIds.add(userId);
+    }
 
     res.write(`event: connected\ndata: ${JSON.stringify({ ok: true })}\n\n`);
 
@@ -551,6 +896,9 @@ async function startServer(): Promise<void> {
     req.on('close', () => {
       clearInterval(keepAlive);
       sseClients.get(userId)?.delete(res);
+      if ((sseClients.get(userId)?.size ?? 0) === 0 && authUser.role === 'admin') {
+        sseAdminUserIds.delete(userId);
+      }
     });
   });
 
@@ -872,6 +1220,8 @@ async function startServer(): Promise<void> {
       freeShippingByCoupon
     );
     const total = roundMoney(subtotalAfterDiscount + (shippingFee ?? 0));
+    const destCoords =
+      deliveryMethod === 'Entrega' ? await geocodeDeliveryAddress(address, coords) : null;
 
     const maxOrderRow = db.prepare('SELECT COALESCE(MAX(orderNumber), 1000) as maxNum FROM orders').get() as {
       maxNum: number;
@@ -883,10 +1233,10 @@ async function startServer(): Promise<void> {
       .prepare(`
         INSERT INTO orders (
           orderNumber, userId, customerName, customerWhatsapp, customerCpf,
-          deliveryMethod, addressJson, distanceKm, paymentMethod, changeFor, itemsJson,
+          deliveryMethod, addressJson, distanceKm, destLat, destLng, paymentMethod, changeFor, itemsJson,
           subtotal, discountAmount, couponCode, shippingFee, shippingLabel, total,
           status, rouletteGranted, notes, createdAt
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pendente', 0, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pendente', 0, ?, ?)
       `)
       .run(
         nextOrderNumber,
@@ -897,6 +1247,8 @@ async function startServer(): Promise<void> {
         deliveryMethod,
         address ? JSON.stringify(address) : null,
         distanceKm,
+        destCoords ? destCoords.lat : null,
+        destCoords ? destCoords.lng : null,
         paymentMethod,
         paymentMethod === 'Dinheiro' ? changeFor : '',
         JSON.stringify(verifiedItems),
@@ -914,7 +1266,14 @@ async function startServer(): Promise<void> {
       .prepare('SELECT * FROM orders WHERE id = ?')
       .get(Number(insertResult.lastInsertRowid)) as Record<string, unknown>;
 
-    res.status(201).json({ order: mapOrderRow(createdRow) });
+    const createdOrder = mapOrderRow(createdRow);
+    pushAdminEvent('order_updated', {
+      orderId: createdOrder.id,
+      orderNumber: createdOrder.orderNumber,
+      status: createdOrder.status,
+    });
+
+    res.status(201).json({ order: createdOrder });
   });
 
   // Customer's own orders
@@ -923,6 +1282,262 @@ async function startServer(): Promise<void> {
       .prepare('SELECT * FROM orders WHERE userId = ? ORDER BY id DESC')
       .all(req.authUser!.id) as Record<string, unknown>[];
     res.json({ orders: rows.map(mapOrderRow) });
+  });
+
+  // Real-time delivery tracking info (strictly restricted to order owner, assigned courier, or admin)
+  app.get('/api/orders/:id/tracking', requireAuth, async (req: AuthenticatedRequest, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      res.status(400).json({ error: 'Pedido inválido.' });
+      return;
+    }
+
+    const row = db.prepare('SELECT * FROM orders WHERE id = ?').get(id) as
+      | Record<string, unknown>
+      | undefined;
+    if (!row) {
+      res.status(404).json({ error: 'Pedido não encontrado.' });
+      return;
+    }
+
+    const order = mapOrderRow(row);
+    const authUser = req.authUser!;
+    const isOwner = order.userId === authUser.id;
+    const isAdmin = authUser.role === 'admin';
+    const isAssignedCourier = authUser.role === 'courier' && order.assignedCourierId === authUser.id;
+
+    if (!isOwner && !isAdmin && !isAssignedCourier) {
+      res.status(403).json({ error: 'Você não tem permissão para acompanhar este pedido.' });
+      return;
+    }
+
+    if (order.deliveryMethod !== 'Entrega') {
+      res.status(400).json({ error: 'Rastreamento disponível apenas para pedidos de entrega.' });
+      return;
+    }
+
+    let currentRow = row;
+    if (!order.destCoords && order.address) {
+      const geocoded = await geocodeDeliveryAddress(order.address);
+      if (geocoded) {
+        db.prepare('UPDATE orders SET destLat = ?, destLng = ? WHERE id = ?').run(
+          geocoded.lat,
+          geocoded.lng,
+          id
+        );
+        currentRow = db.prepare('SELECT * FROM orders WHERE id = ?').get(id) as Record<string, unknown>;
+      }
+    }
+
+    const settingsRow = db.prepare('SELECT * FROM store_settings WHERE id = 1').get() as Record<string, unknown>;
+    const settings = mapSettingsRow(settingsRow);
+    res.json({ tracking: mapDeliveryTrackingInfo(currentRow, settings) });
+  });
+
+  // ================= COURIER (MOTOBOY) DELIVERY TRACKING ROUTES =================
+
+  app.get('/api/courier/orders', requireAuth, requireCourier, (req: AuthenticatedRequest, res) => {
+    const courierId = req.authUser!.id;
+    const rows = db
+      .prepare(
+        `SELECT * FROM orders
+         WHERE assignedCourierId = ? AND deliveryMethod = 'Entrega'
+         ORDER BY CASE WHEN status = 'Saiu para entrega' THEN 0 ELSE 1 END, id DESC`
+      )
+      .all(courierId) as Record<string, unknown>[];
+    res.json({ orders: rows.map(mapOrderRow) });
+  });
+
+  app.post('/api/courier/orders/:id/tracking/start', requireAuth, requireCourier, async (req: AuthenticatedRequest, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      res.status(400).json({ error: 'Pedido inválido.' });
+      return;
+    }
+
+    const row = db.prepare('SELECT * FROM orders WHERE id = ?').get(id) as
+      | Record<string, unknown>
+      | undefined;
+    if (!row) {
+      res.status(404).json({ error: 'Pedido não encontrado.' });
+      return;
+    }
+
+    const order = mapOrderRow(row);
+    if (order.assignedCourierId !== req.authUser!.id) {
+      res.status(403).json({ error: 'Esta entrega não está atribuída a você.' });
+      return;
+    }
+    if (order.deliveryMethod !== 'Entrega' || order.status !== 'Saiu para entrega') {
+      res.status(400).json({
+        error: 'O compartilhamento só pode ser iniciado quando o pedido estiver com status "Saiu para entrega".',
+      });
+      return;
+    }
+
+    if (!order.destCoords && order.address) {
+      const geocoded = await geocodeDeliveryAddress(order.address);
+      if (geocoded) {
+        db.prepare('UPDATE orders SET destLat = ?, destLng = ? WHERE id = ?').run(
+          geocoded.lat,
+          geocoded.lng,
+          id
+        );
+      }
+    }
+
+    const nextGpsStatus = order.courierGpsStatus === 'active' ? 'active' : 'waiting';
+    db.prepare('UPDATE orders SET trackingActive = 1, courierGpsStatus = ? WHERE id = ?').run(nextGpsStatus, id);
+
+    const updatedRow = db.prepare('SELECT * FROM orders WHERE id = ?').get(id) as Record<string, unknown>;
+    const settingsRow = db.prepare('SELECT * FROM store_settings WHERE id = 1').get() as Record<string, unknown>;
+    const tracking = mapDeliveryTrackingInfo(updatedRow, mapSettingsRow(settingsRow));
+
+    pushUserEvent(order.userId, 'tracking_updated', tracking);
+    pushUserEvent(req.authUser!.id, 'tracking_updated', tracking);
+    pushAdminEvent('tracking_updated', tracking);
+
+    res.json({ tracking });
+  });
+
+  app.post('/api/courier/orders/:id/location', requireAuth, requireCourier, (req: AuthenticatedRequest, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      res.status(400).json({ error: 'Pedido inválido.' });
+      return;
+    }
+
+    const row = db.prepare('SELECT * FROM orders WHERE id = ?').get(id) as
+      | Record<string, unknown>
+      | undefined;
+    if (!row) {
+      res.status(404).json({ error: 'Pedido não encontrado.' });
+      return;
+    }
+
+    const order = mapOrderRow(row);
+    if (order.assignedCourierId !== req.authUser!.id) {
+      res.status(403).json({ error: 'Você só pode enviar localização para entregas atribuídas a você.' });
+      return;
+    }
+    if (order.deliveryMethod !== 'Entrega' || order.status !== 'Saiu para entrega') {
+      res.status(400).json({ error: 'Rastreamento encerrado ou pedido ainda não saiu para entrega.' });
+      return;
+    }
+
+    const requestedStatus = typeof req.body?.gpsStatus === 'string' ? req.body.gpsStatus : '';
+    if (requestedStatus === 'unavailable') {
+      db.prepare("UPDATE orders SET trackingActive = 1, courierGpsStatus = 'unavailable' WHERE id = ?").run(id);
+      const updatedRow = db.prepare('SELECT * FROM orders WHERE id = ?').get(id) as Record<string, unknown>;
+      const settingsRow = db.prepare('SELECT * FROM store_settings WHERE id = 1').get() as Record<string, unknown>;
+      const tracking = mapDeliveryTrackingInfo(updatedRow, mapSettingsRow(settingsRow));
+
+      pushUserEvent(order.userId, 'tracking_updated', tracking);
+      pushUserEvent(req.authUser!.id, 'tracking_updated', tracking);
+      pushAdminEvent('tracking_updated', tracking);
+
+      res.json({ tracking });
+      return;
+    }
+
+    const coords = validateGpsCoordinates(req.body?.lat, req.body?.lng);
+    if (!coords) {
+      res.status(400).json({ error: 'Coordenadas de GPS inválidas.' });
+      return;
+    }
+
+    const accuracy = Number.isFinite(Number(req.body?.accuracy)) ? Math.max(0, Number(req.body.accuracy)) : null;
+    const heading = Number.isFinite(Number(req.body?.heading)) ? Number(req.body.heading) : null;
+    const speed = Number.isFinite(Number(req.body?.speed)) ? Math.max(0, Number(req.body.speed)) : null;
+    const now = new Date().toISOString();
+
+    db.prepare(`
+      UPDATE orders SET
+        trackingActive = 1,
+        courierLat = ?,
+        courierLng = ?,
+        courierAccuracy = ?,
+        courierHeading = ?,
+        courierSpeed = ?,
+        courierGpsStatus = 'active',
+        lastLocationAt = ?
+      WHERE id = ?
+    `).run(coords.lat, coords.lng, accuracy, heading, speed, now, id);
+
+    db.prepare(`
+      INSERT INTO delivery_tracking_points (orderId, courierId, lat, lng, accuracy, heading, speed, recordedAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, req.authUser!.id, coords.lat, coords.lng, accuracy, heading, speed, now);
+
+    const updatedRow = db.prepare('SELECT * FROM orders WHERE id = ?').get(id) as Record<string, unknown>;
+    const settingsRow = db.prepare('SELECT * FROM store_settings WHERE id = 1').get() as Record<string, unknown>;
+    const tracking = mapDeliveryTrackingInfo(updatedRow, mapSettingsRow(settingsRow));
+
+    pushUserEvent(order.userId, 'tracking_updated', tracking);
+    pushUserEvent(req.authUser!.id, 'tracking_updated', tracking);
+    pushAdminEvent('tracking_updated', tracking);
+
+    res.json({ tracking });
+  });
+
+  app.post('/api/courier/orders/:id/tracking/stop', requireAuth, requireCourier, (req: AuthenticatedRequest, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      res.status(400).json({ error: 'Pedido inválido.' });
+      return;
+    }
+
+    const row = db.prepare('SELECT * FROM orders WHERE id = ?').get(id) as
+      | Record<string, unknown>
+      | undefined;
+    if (!row) {
+      res.status(404).json({ error: 'Pedido não encontrado.' });
+      return;
+    }
+
+    const order = mapOrderRow(row);
+    if (order.assignedCourierId !== req.authUser!.id) {
+      res.status(403).json({ error: 'Esta entrega não está atribuída a você.' });
+      return;
+    }
+
+    const markDelivered = Boolean(req.body?.markDelivered);
+    const now = new Date().toISOString();
+
+    if (markDelivered) {
+      db.prepare(`
+        UPDATE orders SET
+          status = 'Entregue',
+          trackingActive = 0,
+          courierGpsStatus = 'ended',
+          deliveredAt = COALESCE(deliveredAt, ?)
+        WHERE id = ?
+      `).run(now, id);
+    } else {
+      db.prepare("UPDATE orders SET courierGpsStatus = 'unavailable' WHERE id = ?").run(id);
+    }
+
+    const updatedRow = db.prepare('SELECT * FROM orders WHERE id = ?').get(id) as Record<string, unknown>;
+    const updatedOrder = mapOrderRow(updatedRow);
+    const settingsRow = db.prepare('SELECT * FROM store_settings WHERE id = 1').get() as Record<string, unknown>;
+    const tracking = mapDeliveryTrackingInfo(updatedRow, mapSettingsRow(settingsRow));
+
+    if (markDelivered) {
+      const statusPayload = {
+        orderId: updatedOrder.id,
+        orderNumber: updatedOrder.orderNumber,
+        status: updatedOrder.status,
+      };
+      pushUserEvent(updatedOrder.userId, 'order_updated', statusPayload);
+      pushUserEvent(req.authUser!.id, 'order_updated', statusPayload);
+      pushAdminEvent('order_updated', statusPayload);
+    }
+
+    pushUserEvent(updatedOrder.userId, 'tracking_updated', tracking);
+    pushUserEvent(req.authUser!.id, 'tracking_updated', tracking);
+    pushAdminEvent('tracking_updated', tracking);
+
+    res.json({ order: updatedOrder, tracking });
   });
 
   // ================= CUSTOMER ROULETTE ROUTES =================
@@ -1057,14 +1672,157 @@ async function startServer(): Promise<void> {
       mapOrderRow
     );
     const settingsRow = db.prepare('SELECT * FROM store_settings WHERE id = 1').get() as Record<string, unknown>;
+    const couriers = listCouriers();
 
     res.json({
       products,
       coupons,
       slides,
       orders,
+      couriers,
       settings: mapSettingsRow(settingsRow),
     });
+  });
+
+  // Admin Courier Accounts & Delivery Assignment
+  app.get('/api/admin/couriers', requireAuth, requireAdmin, (_req, res) => {
+    res.json({ couriers: listCouriers() });
+  });
+
+  app.post('/api/admin/couriers', requireAuth, requireAdmin, (req, res) => {
+    const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    const whatsapp = typeof req.body?.whatsapp === 'string' ? req.body.whatsapp.trim() : '';
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+
+    if (name.length < 2) {
+      res.status(400).json({ error: 'Informe o nome do motoboy (mínimo 2 caracteres).' });
+      return;
+    }
+    if (!email || !email.includes('@') || email.length > 160) {
+      res.status(400).json({ error: 'Informe um e-mail válido para o motoboy.' });
+      return;
+    }
+    if (password.length < 6 || password.length > 128) {
+      res.status(400).json({ error: 'A senha do motoboy deve ter pelo menos 6 caracteres.' });
+      return;
+    }
+
+    const existing = getUserByEmail(email);
+    if (existing) {
+      res.status(409).json({ error: 'Já existe uma conta cadastrada com este e-mail.' });
+      return;
+    }
+
+    const created = createUserRecord({
+      name,
+      email,
+      whatsapp,
+      passwordHash: hashPassword(password),
+      role: 'courier',
+    });
+
+    res.status(201).json({
+      courier: {
+        id: created.id,
+        name: created.name,
+        email: created.email,
+        whatsapp: created.whatsapp,
+        active: created.active !== false,
+        createdAt: created.createdAt,
+      },
+    });
+  });
+
+  app.patch('/api/admin/couriers/:id', requireAuth, requireAdmin, (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      res.status(400).json({ error: 'ID inválido.' });
+      return;
+    }
+    const existing = getUserById(id);
+    if (!existing || existing.role !== 'courier') {
+      res.status(404).json({ error: 'Motoboy não encontrado.' });
+      return;
+    }
+
+    const active = req.body?.active !== false ? 1 : 0;
+    db.prepare("UPDATE users SET active = ? WHERE id = ? AND role = 'courier'").run(active, id);
+    const updated = getUserById(id)!;
+    res.json({
+      courier: {
+        id: updated.id,
+        name: updated.name,
+        email: updated.email,
+        whatsapp: updated.whatsapp,
+        active: updated.active !== false,
+        createdAt: updated.createdAt,
+      },
+    });
+  });
+
+  app.patch('/api/admin/orders/:id/assign-courier', requireAuth, requireAdmin, (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      res.status(400).json({ error: 'Pedido inválido.' });
+      return;
+    }
+
+    const existingRow = db.prepare('SELECT * FROM orders WHERE id = ?').get(id) as
+      | Record<string, unknown>
+      | undefined;
+    if (!existingRow) {
+      res.status(404).json({ error: 'Pedido não encontrado.' });
+      return;
+    }
+
+    const existingOrder = mapOrderRow(existingRow);
+    const rawCourierId = req.body?.courierId;
+    let assignedCourierId: number | null = null;
+    let assignedCourierName = '';
+
+    if (rawCourierId !== null && rawCourierId !== undefined && rawCourierId !== '') {
+      const courierId = Number(rawCourierId);
+      if (!Number.isInteger(courierId)) {
+        res.status(400).json({ error: 'Motoboy inválido.' });
+        return;
+      }
+      const courier = getUserById(courierId);
+      if (!courier || courier.role !== 'courier' || courier.active === false) {
+        res.status(400).json({ error: 'Motoboy não encontrado ou desativado.' });
+        return;
+      }
+      assignedCourierId = courier.id;
+      assignedCourierName = courier.name;
+    }
+
+    db.prepare('UPDATE orders SET assignedCourierId = ?, assignedCourierName = ? WHERE id = ?').run(
+      assignedCourierId,
+      assignedCourierName,
+      id
+    );
+
+    const updatedRow = db.prepare('SELECT * FROM orders WHERE id = ?').get(id) as Record<string, unknown>;
+    const updatedOrder = mapOrderRow(updatedRow);
+    const settingsRow = db.prepare('SELECT * FROM store_settings WHERE id = 1').get() as Record<string, unknown>;
+    const tracking = mapDeliveryTrackingInfo(updatedRow, mapSettingsRow(settingsRow));
+
+    pushUserEvent(updatedOrder.userId, 'order_updated', {
+      orderId: updatedOrder.id,
+      orderNumber: updatedOrder.orderNumber,
+      status: updatedOrder.status,
+    });
+    pushUserEvent(updatedOrder.userId, 'tracking_updated', tracking);
+    if (existingOrder.assignedCourierId && existingOrder.assignedCourierId !== assignedCourierId) {
+      pushUserEvent(existingOrder.assignedCourierId, 'order_updated', { orderId: updatedOrder.id });
+    }
+    if (assignedCourierId) {
+      pushUserEvent(assignedCourierId, 'order_updated', { orderId: updatedOrder.id });
+      pushUserEvent(assignedCourierId, 'tracking_updated', tracking);
+    }
+    pushAdminEvent('tracking_updated', tracking);
+
+    res.json({ order: updatedOrder });
   });
 
   // Admin Roulette Overview & Prize Management
@@ -1490,12 +2248,47 @@ async function startServer(): Promise<void> {
   });
 
   // Admin Order Status Update -> Automatically grants 1 roulette chance per R$ 50,00 subtotal on 'Confirmado'
-  app.patch('/api/admin/orders/:id/status', requireAuth, requireAdmin, (req, res) => {
+  // and unlocks / terminates live delivery tracking on 'Saiu para entrega' / 'Entregue'
+  app.patch('/api/admin/orders/:id/status', requireAuth, requireAdmin, async (req, res) => {
     const id = Number(req.params.id);
     const status = req.body?.status as OrderStatus;
+    const rawCourierId = req.body?.assignedCourierId;
     if (!Number.isInteger(id) || !VALID_ORDER_STATUSES.includes(status)) {
       res.status(400).json({ error: 'Dados inválidos para atualizar pedido.' });
       return;
+    }
+
+    let nextAssignedCourierId: number | null | undefined = undefined;
+    let nextAssignedCourierName = '';
+    if (rawCourierId !== undefined) {
+      if (rawCourierId === null || rawCourierId === '') {
+        nextAssignedCourierId = null;
+        nextAssignedCourierName = '';
+      } else {
+        const courierId = Number(rawCourierId);
+        const courier = Number.isInteger(courierId) ? getUserById(courierId) : null;
+        if (!courier || courier.role !== 'courier' || courier.active === false) {
+          res.status(400).json({ error: 'Motoboy selecionado inválido ou desativado.' });
+          return;
+        }
+        nextAssignedCourierId = courier.id;
+        nextAssignedCourierName = courier.name;
+      }
+    }
+
+    let existingOrderSnapshot: ReturnType<typeof mapOrderRow> | null = null;
+    const preRow = db.prepare('SELECT * FROM orders WHERE id = ?').get(id) as
+      | Record<string, unknown>
+      | undefined;
+    if (!preRow) {
+      res.status(404).json({ error: 'Pedido não encontrado.' });
+      return;
+    }
+    existingOrderSnapshot = mapOrderRow(preRow);
+
+    let geocodedCoords: Coordinates | null = existingOrderSnapshot.destCoords;
+    if (status === 'Saiu para entrega' && existingOrderSnapshot.deliveryMethod === 'Entrega' && !geocodedCoords && existingOrderSnapshot.address) {
+      geocodedCoords = await geocodeDeliveryAddress(existingOrderSnapshot.address);
     }
 
     db.exec('BEGIN IMMEDIATE');
@@ -1536,16 +2329,59 @@ async function startServer(): Promise<void> {
         db.prepare('UPDATE orders SET status = ? WHERE id = ?').run(status, id);
       }
 
+      if (nextAssignedCourierId !== undefined) {
+        db.prepare('UPDATE orders SET assignedCourierId = ?, assignedCourierName = ? WHERE id = ?').run(
+          nextAssignedCourierId,
+          nextAssignedCourierName,
+          id
+        );
+      }
+
+      if (status === 'Saiu para entrega' && existingOrder.deliveryMethod === 'Entrega') {
+        const nextGps = existingOrder.courierGpsStatus === 'active' ? 'active' : 'waiting';
+        db.prepare(
+          'UPDATE orders SET trackingActive = 1, courierGpsStatus = ?, destLat = COALESCE(destLat, ?), destLng = COALESCE(destLng, ?) WHERE id = ?'
+        ).run(
+          nextGps,
+          geocodedCoords ? geocodedCoords.lat : null,
+          geocodedCoords ? geocodedCoords.lng : null,
+          id
+        );
+      } else if (status === 'Entregue' || status === 'Concluído' || status === 'Cancelado') {
+        const nowIso = new Date().toISOString();
+        if (status === 'Entregue') {
+          db.prepare(
+            "UPDATE orders SET trackingActive = 0, courierGpsStatus = 'ended', deliveredAt = COALESCE(deliveredAt, ?) WHERE id = ?"
+          ).run(nowIso, id);
+        } else {
+          db.prepare("UPDATE orders SET trackingActive = 0, courierGpsStatus = 'ended' WHERE id = ?").run(id);
+        }
+      } else {
+        db.prepare('UPDATE orders SET trackingActive = 0 WHERE id = ?').run(id);
+      }
+
       const updatedRow = db.prepare('SELECT * FROM orders WHERE id = ?').get(id) as Record<string, unknown>;
       const updatedOrder = mapOrderRow(updatedRow);
+      const settingsRow = db.prepare('SELECT * FROM store_settings WHERE id = 1').get() as Record<string, unknown>;
+      const tracking = mapDeliveryTrackingInfo(updatedRow, mapSettingsRow(settingsRow));
       db.exec('COMMIT');
 
-      // Real-time push to the customer's open browser session
-      pushUserEvent(updatedOrder.userId, 'order_updated', {
+      const statusPayload = {
         orderId: updatedOrder.id,
         orderNumber: updatedOrder.orderNumber,
         status: updatedOrder.status,
-      });
+      };
+
+      // Real-time push to customer, assigned courier, and open admin sessions
+      pushUserEvent(updatedOrder.userId, 'order_updated', statusPayload);
+      pushUserEvent(updatedOrder.userId, 'tracking_updated', tracking);
+      if (updatedOrder.assignedCourierId) {
+        pushUserEvent(updatedOrder.assignedCourierId, 'order_updated', statusPayload);
+        pushUserEvent(updatedOrder.assignedCourierId, 'tracking_updated', tracking);
+      }
+      pushAdminEvent('order_updated', statusPayload);
+      pushAdminEvent('tracking_updated', tracking);
+
       if (grantedNow > 0) {
         pushUserEvent(updatedOrder.userId, 'roulette_updated', {
           grantedNow,
@@ -1568,7 +2404,12 @@ async function startServer(): Promise<void> {
   // Serve Vite or built dist
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        allowedHosts: true,
+        hmr: process.env.DISABLE_HMR === 'true' ? false : { server: httpServer },
+        ws: { server: httpServer },
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -1581,7 +2422,7 @@ async function startServer(): Promise<void> {
   }
 
   const port = Number(process.env.PORT || 3000);
-  app.listen(port, '0.0.0.0', () => {
+  httpServer.listen(port, '0.0.0.0', () => {
     console.log(`R&P Tabacaria server running on http://0.0.0.0:${port}`);
   });
 }
