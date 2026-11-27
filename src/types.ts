@@ -1,4 +1,4 @@
-export type UserRole = 'admin' | 'customer';
+export type UserRole = 'admin' | 'customer' | 'courier';
 
 export interface DeliveryAddress {
   street: string;
@@ -16,6 +16,16 @@ export interface User {
   cpf: string;
   savedAddress: DeliveryAddress | null;
   role: UserRole;
+  active?: boolean;
+  createdAt: string;
+}
+
+export interface CourierSummary {
+  id: number;
+  name: string;
+  email: string;
+  whatsapp: string;
+  active: boolean;
   createdAt: string;
 }
 
@@ -96,9 +106,12 @@ export type OrderStatus =
   | 'Confirmado'
   | 'Em preparo'
   | 'Saiu para entrega'
+  | 'Entregue'
   | 'Pronto para retirada'
   | 'Concluído'
   | 'Cancelado';
+
+export type CourierGpsStatus = 'waiting' | 'active' | 'unavailable' | 'ended';
 
 export interface Coordinates {
   lat: number;
@@ -153,6 +166,35 @@ export interface Order {
   rouletteGranted: boolean;
   notes: string;
   createdAt: string;
+  assignedCourierId: number | null;
+  assignedCourierName: string;
+  destCoords: Coordinates | null;
+  trackingActive: boolean;
+  courierGpsStatus: CourierGpsStatus;
+  lastLocationAt: string | null;
+  deliveredAt: string | null;
+}
+
+export interface DeliveryTrackingInfo {
+  orderId: number;
+  orderNumber: number;
+  status: OrderStatus;
+  deliveryMethod: DeliveryMethod;
+  customerName: string;
+  address: DeliveryAddress | null;
+  destCoords: Coordinates | null;
+  storeCoords: Coordinates;
+  storeAddress: string;
+  assignedCourierId: number | null;
+  assignedCourierName: string;
+  trackingActive: boolean;
+  courierCoords: Coordinates | null;
+  courierAccuracy: number | null;
+  courierHeading: number | null;
+  courierSpeed: number | null;
+  courierGpsStatus: CourierGpsStatus;
+  lastLocationAt: string | null;
+  deliveredAt: string | null;
 }
 
 export type RoulettePrizeType = 'free_shipping' | 'percent' | 'none';
