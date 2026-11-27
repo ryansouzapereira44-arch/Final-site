@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Package } from 'lucide-react';
 
 export function BrandLogoSVG({ size = 40 }: { size?: number }) {
@@ -39,6 +39,10 @@ export function SafeProductImage({
   className?: string;
 }) {
   const [errored, setErrored] = useState(false);
+
+  useEffect(() => {
+    setErrored(false);
+  }, [src]);
 
   if (!src || errored) {
     return (
