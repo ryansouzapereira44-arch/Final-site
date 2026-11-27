@@ -2,9 +2,11 @@ import type {
   CarouselSlide,
   CartItem,
   Coordinates,
+  CourierSummary,
   Coupon,
   DeliveryAddress,
   DeliveryMethod,
+  DeliveryTrackingInfo,
   Order,
   OrderStatus,
   PaymentMethod,
@@ -20,6 +22,7 @@ import type {
 export interface AuthStatusResponse {
   adminClaimed: boolean;
   adminEmail: string;
+  user?: User | null;
 }
 
 export interface AuthResponse {
@@ -39,6 +42,7 @@ export interface AdminOverviewResponse {
   coupons: Coupon[];
   slides: CarouselSlide[];
   orders: Order[];
+  couriers: CourierSummary[];
   settings: StoreSettings;
 }
 
@@ -109,6 +113,30 @@ export const api = {
 
   login(payload: { email: string; password: string }): Promise<AuthResponse> {
     return request<AuthResponse>('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  forgotPassword(email: string): Promise<{ ok: boolean; message: string }> {
+    return request<{ ok: boolean; message: string }>('/api/auth/forgot-password', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    });
+  },
+
+  validateResetToken(token: string): Promise<{ valid: boolean; emailHint?: string }> {
+    return request<{ valid: boolean; emailHint?: string }>(
+      `/api/auth/reset-password/validate?token=${encodeURIComponent(token)}`
+    );
+  },
+
+  resetPassword(payload: {
+    token: string;
+    password: string;
+    confirmPassword: string;
+  }): Promise<{ ok: boolean; message: string }> {
+    return request<{ ok: boolean; message: string }>('/api/auth/reset-password', {
       method: 'POST',
       body: JSON.stringify(payload),
     });
@@ -207,6 +235,58 @@ export const api = {
 
   getMyOrders(token: string | null): Promise<{ orders: Order[] }> {
     return request<{ orders: Order[] }>('/api/orders/mine', {}, token);
+  },
+
+  getOrderTracking(token: string | null, orderId: number): Promise<{ tracking: DeliveryTrackingInfo }> {
+    return request<{ tracking: DeliveryTrackingInfo }>(`/api/orders/${orderId}/tracking`, {}, token);
+  },
+
+  // Courier (Motoboy)
+  getCourierOrders(token: string | null): Promise<{ orders: Order[] }> {
+    return request<{ orders: Order[] }>('/api/courier/orders', {}, token);
+  },
+
+  startCourierTracking(
+    token: string | null,
+    orderId: number
+  ): Promise<{ tracking: DeliveryTrackingInfo }> {
+    return request<{ tracking: DeliveryTrackingInfo }>(
+      `/api/courier/orders/${orderId}/tracking/start`,
+      { method: 'POST' },
+      token
+    );
+  },
+
+  sendCourierLocation(
+    token: string | null,
+    orderId: number,
+    payload:
+      | { lat: number; lng: number; accuracy?: number | null; heading?: number | null; speed?: number | null }
+      | { gpsStatus: 'unavailable' }
+  ): Promise<{ tracking: DeliveryTrackingInfo }> {
+    return request<{ tracking: DeliveryTrackingInfo }>(
+      `/api/courier/orders/${orderId}/location`,
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      },
+      token
+    );
+  },
+
+  stopCourierTracking(
+    token: string | null,
+    orderId: number,
+    markDelivered: boolean
+  ): Promise<{ order: Order; tracking: DeliveryTrackingInfo }> {
+    return request<{ order: Order; tracking: DeliveryTrackingInfo }>(
+      `/api/courier/orders/${orderId}/tracking/stop`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ markDelivered }),
+      },
+      token
+    );
   },
 
   // Roulette
@@ -321,6 +401,17 @@ export const api = {
     return request<{ deleted: boolean }>(`/api/admin/coupons/${id}`, { method: 'DELETE' }, token);
   },
 
+  uploadAdminImage(token: string | null, dataUrl: string): Promise<{ imageUrl: string }> {
+    return request<{ imageUrl: string }>(
+      '/api/admin/upload-image',
+      {
+        method: 'POST',
+        body: JSON.stringify({ dataUrl }),
+      },
+      token
+    );
+  },
+
   saveSlide(token: string | null, slide: Omit<CarouselSlide, 'id'> & { id?: number }): Promise<{ slide: CarouselSlide }> {
     const isEdit = typeof slide.id === 'number';
     return request<{ slide: CarouselSlide }>(
@@ -351,13 +442,62 @@ export const api = {
   updateOrderStatus(
     token: string | null,
     orderId: number,
-    status: OrderStatus
+    status: OrderStatus,
+    assignedCourierId?: number | null
   ): Promise<{ order: Order; chancesGranted?: number }> {
     return request<{ order: Order; chancesGranted?: number }>(
       `/api/admin/orders/${orderId}/status`,
       {
         method: 'PATCH',
-        body: JSON.stringify({ status }),
+        body: JSON.stringify({ status, assignedCourierId }),
+      },
+      token
+    );
+  },
+
+  getAdminCouriers(token: string | null): Promise<{ couriers: CourierSummary[] }> {
+    return request<{ couriers: CourierSummary[] }>('/api/admin/couriers', {}, token);
+  },
+
+  createAdminCourier(
+    token: string | null,
+    payload: { name: string; email: string; whatsapp: string; password: string }
+  ): Promise<{ courier: CourierSummary }> {
+    return request<{ courier: CourierSummary }>(
+      '/api/admin/couriers',
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      },
+      token
+    );
+  },
+
+  toggleCourierActive(
+    token: string | null,
+    courierId: number,
+    active: boolean
+  ): Promise<{ courier: CourierSummary }> {
+    return request<{ courier: CourierSummary }>(
+      `/api/admin/couriers/${courierId}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({ active }),
+      },
+      token
+    );
+  },
+
+  assignOrderCourier(
+    token: string | null,
+    orderId: number,
+    courierId: number | null
+  ): Promise<{ order: Order }> {
+    return request<{ order: Order }>(
+      `/api/admin/orders/${orderId}/assign-courier`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({ courierId }),
       },
       token
     );
