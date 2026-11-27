@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import type { NextFunction, Request, Response } from 'express';
 import { getUserById, hasAdminUser } from './db.ts';
-import type { User } from '../src/types.ts';
+import type { User, UserRole } from '../src/types.ts';
 
 const EPHEMERAL_FALLBACK_KEY = crypto.randomBytes(32).toString('hex');
 export const SESSION_COOKIE_NAME = 'rp_session';
@@ -49,7 +49,7 @@ export function verifyEnvAdminPassword(candidate: string): boolean {
 
 interface TokenPayload {
   userId: number;
-  role: 'admin' | 'customer';
+  role: UserRole;
   exp: number;
 }
 
@@ -139,6 +139,21 @@ export interface AuthenticatedRequest extends Request {
   authUser?: User;
 }
 
+export function getOptionalAuthUser(req: Request): User | null {
+  const authHeader = req.headers.authorization || '';
+  const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
+  const cookieToken = parseCookieHeader(req.headers.cookie, SESSION_COOKIE_NAME);
+  const token = bearerToken || cookieToken;
+  if (!token) return null;
+
+  const payload = verifySessionToken(token);
+  if (!payload) return null;
+
+  const user = getUserById(payload.userId);
+  if (!user || user.active === false) return null;
+  return user;
+}
+
 export function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
   const authHeader = req.headers.authorization || '';
   const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
@@ -164,8 +179,8 @@ export function requireAuth(req: AuthenticatedRequest, res: Response, next: Next
     return;
   }
   const user = getUserById(payload.userId);
-  if (!user) {
-    res.status(401).json({ error: 'Usuário não encontrado.' });
+  if (!user || user.active === false) {
+    res.status(401).json({ error: 'Usuário não encontrado ou desativado.' });
     return;
   }
   req.authUser = user;
@@ -175,6 +190,14 @@ export function requireAuth(req: AuthenticatedRequest, res: Response, next: Next
 export function requireAdmin(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
   if (!req.authUser || req.authUser.role !== 'admin') {
     res.status(403).json({ error: 'Acesso restrito ao administrador da loja.' });
+    return;
+  }
+  next();
+}
+
+export function requireCourier(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
+  if (!req.authUser || req.authUser.role !== 'courier') {
+    res.status(403).json({ error: 'Acesso restrito ao motoboy responsável.' });
     return;
   }
   next();
