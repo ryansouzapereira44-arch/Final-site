@@ -11,6 +11,8 @@ import { BrandLogoSVG } from './components/BrandMark';
 import { CartView } from './components/CartView';
 import { CatalogSection } from './components/CatalogSection';
 import { CheckoutView } from './components/CheckoutView';
+import { CourierDeliveryView } from './components/CourierDeliveryView';
+import { DeliveryTrackingView } from './components/DeliveryTrackingView';
 import { EditorialCarousel } from './components/EditorialCarousel';
 import { Header, type AppView } from './components/Header';
 import { MyAccountView, type AccountSubTab } from './components/MyAccountView';
@@ -22,6 +24,7 @@ import type {
   CartItem,
   CheckoutDraft,
   Coupon,
+  DeliveryTrackingInfo,
   Order,
   Product,
   RouletteStateResponse,
@@ -56,6 +59,19 @@ export default function App() {
   });
   const [user, setUser] = useState<User | null>(null);
   const [token, setToken] = useState<string | null>(null);
+  const [pendingResetToken, setPendingResetToken] = useState<string | null>(() => {
+    if (typeof window === 'undefined') return null;
+    const params = new URLSearchParams(window.location.search);
+    const t = params.get('resetToken');
+    if (t) {
+      params.delete('resetToken');
+      const nextSearch = params.toString();
+      const nextUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ''}${window.location.hash}`;
+      window.history.replaceState({}, '', nextUrl);
+      return t;
+    }
+    return null;
+  });
 
   const [activeView, setActiveView] = useState<AppView>('store');
   const [products, setProducts] = useState<Product[]>([]);
@@ -94,6 +110,10 @@ export default function App() {
   const [accountSubTab, setAccountSubTab] = useState<AccountSubTab>('profile');
   const [rouletteState, setRouletteState] = useState<RouletteStateResponse | null>(null);
   const [liveNotice, setLiveNotice] = useState<string>('');
+  const [selectedTrackingOrderId, setSelectedTrackingOrderId] = useState<number | null>(null);
+  const [trackingReturnView, setTrackingReturnView] = useState<'account' | 'orders' | 'admin'>('account');
+  const [liveTrackingUpdate, setLiveTrackingUpdate] = useState<DeliveryTrackingInfo | null>(null);
+  const [liveSyncCounter, setLiveSyncCounter] = useState(0);
 
   const loadStoreData = useCallback(async (authToken: string | null) => {
     setStoreLoading(true);
@@ -160,17 +180,25 @@ export default function App() {
     let active = true;
     async function restoreSession() {
       try {
-        const [statusRes, meRes] = await Promise.allSettled([api.getAuthStatus(), api.getMe()]);
+        const statusRes = await api.getAuthStatus();
         if (!active) return;
-        if (statusRes.status === 'fulfilled') {
-          setAuthStatus(statusRes.value);
-        }
-        if (meRes.status === 'fulfilled' && meRes.value.user) {
-          const restoredUser = meRes.value.user;
+        setAuthStatus({
+          adminClaimed: statusRes.adminClaimed,
+          adminEmail: statusRes.adminEmail,
+        });
+        if (statusRes.user) {
+          const restoredUser = statusRes.user;
           setUser(restoredUser);
           applyUserProfileToDraft(restoredUser);
-          void loadStoreData(null);
+          if (restoredUser.role === 'courier') {
+            setActiveView('courier');
+          } else {
+            void loadStoreData(null);
+            void loadMyOrders(null);
+          }
         }
+      } catch {
+        // ignore transient startup network error
       } finally {
         if (active) setAuthChecking(false);
       }
@@ -179,12 +207,14 @@ export default function App() {
     return () => {
       active = false;
     };
-  }, [loadStoreData, applyUserProfileToDraft]);
+  }, [loadStoreData, loadMyOrders, applyUserProfileToDraft]);
 
-  // Real-time SSE sync: updates ROLETA chances & order statuses immediately when admin confirms an order
+  // Real-time SSE sync: updates ROLETA chances, order statuses & live delivery tracking
   useEffect(() => {
     if (!user) return;
-    void loadRouletteState(token);
+    if (user.role !== 'courier') {
+      void loadRouletteState(token);
+    }
 
     const es = new EventSource('/api/events', { withCredentials: true });
     es.addEventListener('roulette_updated', (event) => {
@@ -204,7 +234,22 @@ export default function App() {
       }
     });
     es.addEventListener('order_updated', () => {
-      void loadMyOrders(token);
+      if (user.role !== 'courier') {
+        void loadMyOrders(token);
+      }
+      setLiveSyncCounter((c) => c + 1);
+    });
+    es.addEventListener('tracking_updated', (event) => {
+      try {
+        const payload = JSON.parse((event as MessageEvent).data) as DeliveryTrackingInfo;
+        setLiveTrackingUpdate(payload);
+      } catch {
+        // ignore parse error
+      }
+      if (user.role !== 'courier') {
+        void loadMyOrders(token);
+      }
+      setLiveSyncCounter((c) => c + 1);
     });
 
     return () => {
@@ -215,11 +260,18 @@ export default function App() {
   function handleAuthenticated(loggedUser: User, authToken: string) {
     setUser(loggedUser);
     setToken(authToken);
-    setActiveView('store');
     setConfirmedOrder(null);
+    setSelectedTrackingOrderId(null);
+    setLiveTrackingUpdate(null);
     applyUserProfileToDraft(loggedUser, true);
-    void loadStoreData(authToken);
-    void loadRouletteState(authToken);
+    if (loggedUser.role === 'courier') {
+      setActiveView('courier');
+    } else {
+      setActiveView('store');
+      void loadStoreData(authToken);
+      void loadRouletteState(authToken);
+      void loadMyOrders(authToken);
+    }
   }
 
   async function handleLogout() {
@@ -233,6 +285,8 @@ export default function App() {
     setMyOrders([]);
     setRouletteState(null);
     setLiveNotice('');
+    setSelectedTrackingOrderId(null);
+    setLiveTrackingUpdate(null);
     setCheckoutDraft(INITIAL_DRAFT);
     setActiveView('store');
     api
@@ -315,7 +369,15 @@ export default function App() {
 
   function handleNavigate(view: AppView) {
     setConfirmedOrder(null);
+    if (user?.role === 'courier' && view !== 'courier') {
+      setActiveView('courier');
+      return;
+    }
     if (view === 'admin' && user?.role !== 'admin') {
+      setActiveView('store');
+      return;
+    }
+    if (view === 'courier' && user?.role !== 'courier') {
       setActiveView('store');
       return;
     }
@@ -324,8 +386,17 @@ export default function App() {
     }
     if (view === 'account') {
       void loadRouletteState(token);
+      void loadMyOrders(token);
     }
     setActiveView(view);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  function handleOpenTracking(orderId: number, fromView: 'account' | 'orders' | 'admin' = 'account') {
+    setConfirmedOrder(null);
+    setSelectedTrackingOrderId(orderId);
+    setTrackingReturnView(fromView);
+    setActiveView('tracking');
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }
 
@@ -380,11 +451,17 @@ export default function App() {
     );
   }
 
-  if (!user) {
+  if (!user || pendingResetToken) {
     return (
       <AuthGate
         adminClaimed={authStatus.adminClaimed}
         adminEmail={authStatus.adminEmail}
+        initialResetToken={pendingResetToken}
+        onResetTokenFinished={() => {
+          setPendingResetToken(null);
+          setUser(null);
+          setToken(null);
+        }}
         onAuthenticated={handleAuthenticated}
       />
     );
@@ -392,6 +469,7 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-black text-white flex flex-col">
+
       <Header
         user={user}
         activeView={activeView}
@@ -402,7 +480,7 @@ export default function App() {
         onLogout={() => void handleLogout()}
       />
 
-      <main className="flex-1 w-full max-w-7xl mx-auto px-4 sm:px-6 py-8">
+      <main className="flex-1 w-full max-w-[1400px] mx-auto px-3 sm:px-6 py-6 sm:py-8">
         {liveNotice && (
           <div className="mb-6 p-4 rounded-2xl bg-[#111111] border border-white/25 text-xs sm:text-sm text-white flex items-center justify-between gap-3">
             <button
@@ -502,6 +580,7 @@ export default function App() {
             orders={myOrders}
             loading={ordersLoading}
             onBackToStore={() => handleNavigate('store')}
+            onTrackDelivery={(orderId) => handleOpenTracking(orderId, 'orders')}
           />
         ) : activeView === 'account' ? (
           <MyAccountView
@@ -509,6 +588,9 @@ export default function App() {
             user={user}
             subTab={accountSubTab}
             onSubTabChange={setAccountSubTab}
+            orders={myOrders}
+            ordersLoading={ordersLoading}
+            onTrackDelivery={(orderId) => handleOpenTracking(orderId, 'account')}
             rouletteState={rouletteState}
             onProfileSaved={(updatedUser) => {
               setUser(updatedUser);
@@ -517,12 +599,27 @@ export default function App() {
             onRouletteUpdated={(nextState) => setRouletteState(nextState)}
             onApplyPrizeCoupon={(code) => void handleApplyPrizeCoupon(code)}
           />
+        ) : activeView === 'tracking' && selectedTrackingOrderId !== null ? (
+          <DeliveryTrackingView
+            token={token}
+            orderId={selectedTrackingOrderId}
+            liveTrackingUpdate={liveTrackingUpdate}
+            onBack={() => handleNavigate(trackingReturnView)}
+          />
+        ) : activeView === 'courier' && user.role === 'courier' ? (
+          <CourierDeliveryView
+            token={token}
+            user={user}
+            liveSyncTrigger={liveSyncCounter}
+          />
         ) : activeView === 'admin' && user.role === 'admin' ? (
           <AdminPanel
             token={token}
+            liveSyncTrigger={liveSyncCounter}
             onStoreDataChanged={() => {
               void loadStoreData(token);
             }}
+            onOpenTracking={(orderId) => handleOpenTracking(orderId, 'admin')}
           />
         ) : null}
       </main>
