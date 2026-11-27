@@ -1,0 +1,6 @@
+{
+  "name": "R&P Tabacaria",
+  "description": "R&P Tabacaria — Qualidade, variedade e estilo de vida. Catálogo completo, carrinho e pedidos online.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

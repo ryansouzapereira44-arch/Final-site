@@ -1,0 +1,602 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import type {
+  CarouselSlide,
+  Coupon,
+  DeliveryAddress,
+  Order,
+  OrderStatus,
+  Product,
+  RouletteChance,
+  RoulettePrize,
+  RoulettePrizeType,
+  RouletteSpin,
+  StoreSettings,
+  User,
+  UserRole,
+} from '../src/types.ts';
+
+const dataDir = path.resolve(process.cwd(), 'data');
+if (!fs.existsSync(dataDir)) {
+  fs.mkdirSync(dataDir, { recursive: true });
+}
+
+const dbPath = path.join(dataDir, 'tabacaria.db');
+export const db = new DatabaseSync(dbPath);
+
+db.exec(`
+  PRAGMA journal_mode = WAL;
+
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    email TEXT UNIQUE NOT NULL,
+    whatsapp TEXT NOT NULL DEFAULT '',
+    cpf TEXT NOT NULL DEFAULT '',
+    addressJson TEXT,
+    passwordHash TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'customer',
+    createdAt TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS products (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    category TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    price REAL NOT NULL,
+    imageUrl TEXT NOT NULL DEFAULT '',
+    variationsJson TEXT NOT NULL DEFAULT '[]',
+    active INTEGER NOT NULL DEFAULT 1,
+    createdAt TEXT NOT NULL,
+    updatedAt TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS coupons (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT UNIQUE NOT NULL,
+    discountType TEXT NOT NULL,
+    discountValue REAL NOT NULL,
+    minOrderValue REAL NOT NULL DEFAULT 0,
+    freeShipping INTEGER NOT NULL DEFAULT 0,
+    ownerUserId INTEGER,
+    maxUses INTEGER,
+    expiresAt TEXT,
+    active INTEGER NOT NULL DEFAULT 1,
+    usageCount INTEGER NOT NULL DEFAULT 0,
+    createdAt TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS carousel_slides (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tag TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL,
+    subtitle TEXT NOT NULL DEFAULT '',
+    ctaText TEXT NOT NULL DEFAULT 'Ver catálogo',
+    targetCategory TEXT NOT NULL DEFAULT 'Todos',
+    imageUrl TEXT NOT NULL DEFAULT '',
+    sortOrder INTEGER NOT NULL DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1
+  );
+
+  CREATE TABLE IF NOT EXISTS store_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    storeName TEXT NOT NULL,
+    storeOpen INTEGER NOT NULL DEFAULT 1,
+    closedMessage TEXT NOT NULL DEFAULT 'Estamos fechados no momento. Voltamos em breve!',
+    minDeliveryOrder REAL NOT NULL,
+    shippingMode TEXT NOT NULL,
+    shippingPerKm REAL NOT NULL DEFAULT 1.5,
+    freeShippingKm REAL NOT NULL DEFAULT 1.5,
+    shippingFee REAL,
+    freeShippingThreshold REAL,
+    storeCep TEXT NOT NULL DEFAULT '01001-000',
+    storeLat REAL NOT NULL DEFAULT -23.55052,
+    storeLng REAL NOT NULL DEFAULT -46.633308,
+    storeAddress TEXT NOT NULL,
+    storeHours TEXT NOT NULL,
+    storeWhatsapp TEXT NOT NULL,
+    pickupInstructions TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    orderNumber INTEGER UNIQUE NOT NULL,
+    userId INTEGER NOT NULL,
+    customerName TEXT NOT NULL,
+    customerWhatsapp TEXT NOT NULL,
+    customerCpf TEXT NOT NULL DEFAULT '',
+    deliveryMethod TEXT NOT NULL,
+    addressJson TEXT,
+    distanceKm REAL,
+    paymentMethod TEXT NOT NULL,
+    changeFor TEXT NOT NULL DEFAULT '',
+    itemsJson TEXT NOT NULL,
+    subtotal REAL NOT NULL,
+    discountAmount REAL NOT NULL DEFAULT 0,
+    couponCode TEXT,
+    shippingFee REAL,
+    shippingLabel TEXT NOT NULL,
+    total REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'Pendente',
+    rouletteGranted INTEGER NOT NULL DEFAULT 0,
+    notes TEXT NOT NULL DEFAULT '',
+    createdAt TEXT NOT NULL,
+    FOREIGN KEY (userId) REFERENCES users(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS roulette_prizes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    label TEXT NOT NULL,
+    shortLabel TEXT NOT NULL,
+    prizeType TEXT NOT NULL,
+    discountValue REAL NOT NULL DEFAULT 0,
+    weight INTEGER NOT NULL DEFAULT 10,
+    color TEXT NOT NULL DEFAULT '#141414',
+    active INTEGER NOT NULL DEFAULT 1,
+    sortOrder INTEGER NOT NULL DEFAULT 0
+  );
+
+  CREATE TABLE IF NOT EXISTS roulette_chances (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    userId INTEGER NOT NULL,
+    orderId INTEGER NOT NULL,
+    orderNumber INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'available',
+    grantedAt TEXT NOT NULL,
+    expiresAt TEXT NOT NULL,
+    usedAt TEXT,
+    FOREIGN KEY (userId) REFERENCES users(id),
+    FOREIGN KEY (orderId) REFERENCES orders(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS roulette_spins (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    userId INTEGER NOT NULL,
+    userName TEXT NOT NULL,
+    chanceId INTEGER NOT NULL,
+    prizeId INTEGER NOT NULL,
+    prizeLabel TEXT NOT NULL,
+    prizeType TEXT NOT NULL,
+    couponCode TEXT,
+    couponExpiresAt TEXT,
+    createdAt TEXT NOT NULL,
+    FOREIGN KEY (userId) REFERENCES users(id)
+  );
+`);
+
+function ensureColumn(table: string, column: string, definition: string): void {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  if (!cols.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+
+// Safe migrations on existing DB
+ensureColumn('users', 'cpf', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('users', 'addressJson', 'TEXT');
+ensureColumn('coupons', 'freeShipping', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('coupons', 'ownerUserId', 'INTEGER');
+ensureColumn('coupons', 'maxUses', 'INTEGER');
+ensureColumn('coupons', 'expiresAt', 'TEXT');
+ensureColumn('roulette_spins', 'couponExpiresAt', 'TEXT');
+ensureColumn('orders', 'distanceKm', 'REAL');
+ensureColumn('orders', 'rouletteGranted', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('store_settings', 'storeOpen', 'INTEGER NOT NULL DEFAULT 1');
+ensureColumn(
+  'store_settings',
+  'closedMessage',
+  "TEXT NOT NULL DEFAULT 'Estamos fechados no momento. Voltamos em breve!'"
+);
+ensureColumn('store_settings', 'shippingPerKm', 'REAL NOT NULL DEFAULT 1.5');
+ensureColumn('store_settings', 'freeShippingKm', 'REAL NOT NULL DEFAULT 1.5');
+ensureColumn('store_settings', 'storeCep', "TEXT NOT NULL DEFAULT '01001-000'");
+ensureColumn('store_settings', 'storeLat', 'REAL NOT NULL DEFAULT -23.55052');
+ensureColumn('store_settings', 'storeLng', 'REAL NOT NULL DEFAULT -46.633308');
+
+function seedInitialData(): void {
+  const now = new Date().toISOString();
+
+  const settingsCount = db.prepare('SELECT COUNT(*) as count FROM store_settings').get() as { count: number };
+  if (settingsCount.count === 0) {
+    db.prepare(`
+      INSERT INTO store_settings (
+        id, storeName, storeOpen, closedMessage, minDeliveryOrder,
+        shippingMode, shippingPerKm, freeShippingKm, shippingFee, freeShippingThreshold,
+        storeCep, storeLat, storeLng, storeAddress, storeHours, storeWhatsapp, pickupInstructions
+      ) VALUES (1, ?, 1, ?, ?, 'per_km', 1.5, 1.5, NULL, NULL, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'R&P Tabacaria',
+      'Estamos fechados no momento. Voltamos em breve!',
+      0,
+      '01001-000',
+      -23.55052,
+      -46.633308,
+      'Av. Central, 420 - Loja 02, Centro',
+      'Seg a Sáb: 10h às 22h | Dom: 12h às 20h',
+      '(11) 99999-0000',
+      'Apresente o número do pedido no balcão para retirada rápida.'
+    );
+  }
+
+  const prizesCount = db.prepare('SELECT COUNT(*) as count FROM roulette_prizes').get() as { count: number };
+  if (prizesCount.count === 0) {
+    const insertPrize = db.prepare(`
+      INSERT INTO roulette_prizes (label, shortLabel, prizeType, discountValue, weight, color, active, sortOrder)
+      VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+    `);
+    insertPrize.run('Frete Grátis', 'FRETE GRÁTIS', 'free_shipping', 0, 15, '#FFFFFF', 1);
+    insertPrize.run('5% de Desconto', '5% OFF', 'percent', 5, 30, '#181818', 2);
+    insertPrize.run('10% de Desconto', '10% OFF', 'percent', 10, 20, '#2B2B2B', 3);
+    insertPrize.run('15% de Desconto', '15% OFF', 'percent', 15, 10, '#FFFFFF', 4);
+    insertPrize.run('Não foi dessa vez', 'NADA', 'none', 0, 25, '#0F0F0F', 5);
+  }
+
+  const slidesCount = db.prepare('SELECT COUNT(*) as count FROM carousel_slides').get() as { count: number };
+  if (slidesCount.count === 0) {
+    const insertSlide = db.prepare(`
+      INSERT INTO carousel_slides (tag, title, subtitle, ctaText, targetCategory, imageUrl, sortOrder, active)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+    `);
+    insertSlide.run(
+      'QUALIDADE · VARIEDADE · SEMPRE COM VOCÊ',
+      'Mais que tabacaria, é estilo de vida.',
+      'Narguilés completos, essências premium, carvões de coco e acessórios com padrão R&P.',
+      'Explorar catálogo',
+      'Todos',
+      '',
+      1
+    );
+    insertSlide.run(
+      'SELEÇÃO DE ESSÊNCIAS',
+      'Sabores intensos para cada sessão',
+      'Escolha o sabor ideal diretamente no card do produto e monte seu pedido em segundos.',
+      'Ver essências',
+      'Essências',
+      '',
+      2
+    );
+    insertSlide.run(
+      'ENTREGA OU RETIRADA',
+      'Frete grátis até 1,5 km e R$ 1,50 por km',
+      'A cada R$ 50,00 em produtos você ganha 1 chance na Roleta R&P após a confirmação do pedido.',
+      'Ver narguilés',
+      'Narguilés',
+      '',
+      3
+    );
+  }
+
+  const productsCount = db.prepare('SELECT COUNT(*) as count FROM products').get() as { count: number };
+  if (productsCount.count === 0) {
+    const insertProduct = db.prepare(`
+      INSERT INTO products (name, category, description, price, imageUrl, variationsJson, active, createdAt, updatedAt)
+      VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+    `);
+
+    insertProduct.run(
+      'Narguilé R&P Black Edition',
+      'Narguilés',
+      'Setup completo em alumínio anodizado preto fosco com vaso de cristal fumê e mangueira de silicone.',
+      349.9,
+      '/src/assets/images/product_hookah_black_1795779511252.jpg',
+      JSON.stringify(['Preto Fosco / Prata', 'Preto Total']),
+      now,
+      now
+    );
+
+    insertProduct.run(
+      'Essência Premium Blend 250g',
+      'Essências',
+      'Corte fino com alta resistência ao calor e fumaça densa. Embalagem lacrada de 250g.',
+      68.9,
+      '/src/assets/images/product_tobacco_essence_1795779511616.jpg',
+      JSON.stringify(['Dark Berry', 'Menta Glacial', 'Melancia Ice', 'Love 66', 'Uva Roxa']),
+      now,
+      now
+    );
+
+    insertProduct.run(
+      'Essência Classic Pack 50g',
+      'Essências',
+      'Pack tradicional 50g com sabores clássicos e refrescantes para sessões equilibradas.',
+      18.5,
+      '/src/assets/images/product_tobacco_essence_1795779511616.jpg',
+      JSON.stringify(['Hortelã', 'Morango com Creme', 'Maracujá', 'Limão Siciliano']),
+      now,
+      now
+    );
+
+    insertProduct.run(
+      'Carvão de Coco Natural 1kg',
+      'Carvão',
+      'Carvão 100% fibra de coco de alta duração, baixa cinza e sem alteração de sabor.',
+      34.9,
+      '/src/assets/images/product_coconut_charcoal_1795779511363.jpg',
+      JSON.stringify(['Cubo 26mm (1kg)', 'Hexagonal (1kg)']),
+      now,
+      now
+    );
+
+    insertProduct.run(
+      'Rosh Cerâmico Phunnel Black',
+      'Rosh & Acessórios',
+      'Queimador artesanal em cerâmica esmaltada de alta retenção térmica para sessões longas.',
+      49.9,
+      '/src/assets/images/product_ceramic_rosh_1795779511909.jpg',
+      JSON.stringify(['Borda Metálica', 'Preto Clássico']),
+      now,
+      now
+    );
+
+    insertProduct.run(
+      'Pod System Ionic Matte',
+      'Pods & Vapes',
+      'Dispositivo compacto recarregável USB-C com acabamento metálico fosco e fluxo ajustável.',
+      159.9,
+      '/src/assets/images/product_pod_device_1795779511951.jpg',
+      JSON.stringify(['Mint Ice', 'Grape Ice', 'Strawberry Kiwi', 'Menthol']),
+      now,
+      now
+    );
+  }
+
+  const couponsCount = db.prepare('SELECT COUNT(*) as count FROM coupons').get() as { count: number };
+  if (couponsCount.count === 0) {
+    db.prepare(`
+      INSERT INTO coupons (code, discountType, discountValue, minOrderValue, freeShipping, active, usageCount, createdAt)
+      VALUES (?, ?, ?, ?, 0, 1, 0, ?)
+    `).run('RP10', 'percent', 10, 60, now);
+  }
+
+  // Backfill 7-day expiration on any legacy roulette coupons/spins missing expiresAt
+  const legacyCoupons = db
+    .prepare('SELECT id, code, createdAt FROM coupons WHERE ownerUserId IS NOT NULL AND expiresAt IS NULL')
+    .all() as { id: number; code: string; createdAt: string }[];
+  for (const lc of legacyCoupons) {
+    const exp = new Date(new Date(lc.createdAt).getTime() + 7 * 24 * 60 * 60 * 1000).toISOString();
+    db.prepare('UPDATE coupons SET expiresAt = ? WHERE id = ?').run(exp, lc.id);
+    db.prepare('UPDATE roulette_spins SET couponExpiresAt = ? WHERE couponCode = ? AND couponExpiresAt IS NULL').run(
+      exp,
+      lc.code
+    );
+  }
+}
+
+seedInitialData();
+
+export function mapUserRow(row: Record<string, unknown>): User {
+  let savedAddress: DeliveryAddress | null = null;
+  if (row.addressJson) {
+    try {
+      savedAddress = JSON.parse(String(row.addressJson)) as DeliveryAddress;
+    } catch {
+      savedAddress = null;
+    }
+  }
+  return {
+    id: Number(row.id),
+    name: String(row.name),
+    email: String(row.email),
+    whatsapp: String(row.whatsapp || ''),
+    cpf: String(row.cpf || ''),
+    savedAddress,
+    role: row.role === 'admin' ? 'admin' : 'customer',
+    createdAt: String(row.createdAt),
+  };
+}
+
+export function mapProductRow(row: Record<string, unknown>): Product {
+  let variations: string[] = [];
+  try {
+    const parsed = JSON.parse(String(row.variationsJson || '[]'));
+    if (Array.isArray(parsed)) {
+      variations = parsed.map((v) => String(v)).filter(Boolean);
+    }
+  } catch {
+    variations = [];
+  }
+  return {
+    id: Number(row.id),
+    name: String(row.name),
+    category: String(row.category),
+    description: String(row.description || ''),
+    price: Number(row.price),
+    imageUrl: String(row.imageUrl || ''),
+    variations,
+    active: Boolean(row.active),
+    createdAt: String(row.createdAt),
+    updatedAt: String(row.updatedAt),
+  };
+}
+
+export function mapCouponRow(row: Record<string, unknown>): Coupon {
+  const rawType = String(row.discountType);
+  const discountType: Coupon['discountType'] =
+    rawType === 'fixed' ? 'fixed' : rawType === 'free_shipping' ? 'free_shipping' : 'percent';
+  return {
+    id: Number(row.id),
+    code: String(row.code),
+    discountType,
+    discountValue: Number(row.discountValue),
+    minOrderValue: Number(row.minOrderValue || 0),
+    freeShipping: Boolean(row.freeShipping) || discountType === 'free_shipping',
+    ownerUserId: row.ownerUserId !== null && row.ownerUserId !== undefined ? Number(row.ownerUserId) : null,
+    maxUses: row.maxUses !== null && row.maxUses !== undefined ? Number(row.maxUses) : null,
+    expiresAt: row.expiresAt ? String(row.expiresAt) : null,
+    active: Boolean(row.active),
+    usageCount: Number(row.usageCount || 0),
+    createdAt: String(row.createdAt),
+  };
+}
+
+export function mapSlideRow(row: Record<string, unknown>): CarouselSlide {
+  return {
+    id: Number(row.id),
+    tag: String(row.tag || ''),
+    title: String(row.title),
+    subtitle: String(row.subtitle || ''),
+    ctaText: String(row.ctaText || 'Ver catálogo'),
+    targetCategory: String(row.targetCategory || 'Todos'),
+    imageUrl: String(row.imageUrl || ''),
+    sortOrder: Number(row.sortOrder || 0),
+    active: Boolean(row.active),
+  };
+}
+
+export function mapSettingsRow(row: Record<string, unknown>): StoreSettings {
+  const rawMode = String(row.shippingMode || 'per_km');
+  const shippingMode =
+    rawMode === 'fixed' ? 'fixed' : rawMode === 'to_confirm' ? 'to_confirm' : 'per_km';
+
+  return {
+    storeName: String(row.storeName),
+    storeOpen: row.storeOpen !== 0,
+    closedMessage: String(row.closedMessage || 'Estamos fechados no momento. Voltamos em breve!'),
+    minDeliveryOrder: Number(row.minDeliveryOrder || 0),
+    shippingMode,
+    shippingPerKm: Number(row.shippingPerKm ?? 1.5),
+    freeShippingKm: Number(row.freeShippingKm ?? 1.5),
+    shippingFee: row.shippingFee !== null && row.shippingFee !== undefined ? Number(row.shippingFee) : null,
+    freeShippingThreshold:
+      row.freeShippingThreshold !== null && row.freeShippingThreshold !== undefined
+        ? Number(row.freeShippingThreshold)
+        : null,
+    storeCep: String(row.storeCep || '01001-000'),
+    storeLat: Number(row.storeLat ?? -23.55052),
+    storeLng: Number(row.storeLng ?? -46.633308),
+    storeAddress: String(row.storeAddress),
+    storeHours: String(row.storeHours),
+    storeWhatsapp: String(row.storeWhatsapp),
+    pickupInstructions: String(row.pickupInstructions),
+  };
+}
+
+export function mapOrderRow(row: Record<string, unknown>): Order {
+  let address: DeliveryAddress | null = null;
+  if (row.addressJson) {
+    try {
+      address = JSON.parse(String(row.addressJson)) as DeliveryAddress;
+    } catch {
+      address = null;
+    }
+  }
+  let items = [];
+  try {
+    items = JSON.parse(String(row.itemsJson || '[]'));
+  } catch {
+    items = [];
+  }
+  return {
+    id: Number(row.id),
+    orderNumber: Number(row.orderNumber),
+    userId: Number(row.userId),
+    customerName: String(row.customerName),
+    customerWhatsapp: String(row.customerWhatsapp),
+    customerCpf: String(row.customerCpf || ''),
+    deliveryMethod: row.deliveryMethod === 'Retirada na loja' ? 'Retirada na loja' : 'Entrega',
+    address,
+    distanceKm: row.distanceKm !== null && row.distanceKm !== undefined ? Number(row.distanceKm) : null,
+    paymentMethod: String(row.paymentMethod) as Order['paymentMethod'],
+    changeFor: String(row.changeFor || ''),
+    items: Array.isArray(items) ? items : [],
+    subtotal: Number(row.subtotal),
+    discountAmount: Number(row.discountAmount || 0),
+    couponCode: row.couponCode ? String(row.couponCode) : null,
+    shippingFee: row.shippingFee !== null && row.shippingFee !== undefined ? Number(row.shippingFee) : null,
+    shippingLabel: String(row.shippingLabel),
+    total: Number(row.total),
+    status: String(row.status) as OrderStatus,
+    rouletteGranted: Boolean(row.rouletteGranted),
+    notes: String(row.notes || ''),
+    createdAt: String(row.createdAt),
+  };
+}
+
+export function mapPrizeRow(row: Record<string, unknown>): RoulettePrize {
+  return {
+    id: Number(row.id),
+    label: String(row.label),
+    shortLabel: String(row.shortLabel),
+    prizeType: String(row.prizeType) as RoulettePrizeType,
+    discountValue: Number(row.discountValue || 0),
+    weight: Number(row.weight || 0),
+    color: String(row.color || '#141414'),
+    active: Boolean(row.active),
+    sortOrder: Number(row.sortOrder || 0),
+  };
+}
+
+export function mapChanceRow(row: Record<string, unknown>): RouletteChance {
+  return {
+    id: Number(row.id),
+    userId: Number(row.userId),
+    orderId: Number(row.orderId),
+    orderNumber: Number(row.orderNumber),
+    status: String(row.status) as RouletteChance['status'],
+    grantedAt: String(row.grantedAt),
+    expiresAt: String(row.expiresAt),
+    usedAt: row.usedAt ? String(row.usedAt) : null,
+  };
+}
+
+export function mapSpinRow(row: Record<string, unknown>): RouletteSpin {
+  return {
+    id: Number(row.id),
+    userId: Number(row.userId),
+    userName: String(row.userName),
+    chanceId: Number(row.chanceId),
+    prizeId: Number(row.prizeId),
+    prizeLabel: String(row.prizeLabel),
+    prizeType: String(row.prizeType) as RoulettePrizeType,
+    couponCode: row.couponCode ? String(row.couponCode) : null,
+    couponExpiresAt: row.couponExpiresAt ? String(row.couponExpiresAt) : null,
+    createdAt: String(row.createdAt),
+  };
+}
+
+export type UserRecord = User & { passwordHash: string };
+
+export function getUserByEmail(email: string): UserRecord | null {
+  const row = db
+    .prepare(
+      'SELECT id, name, email, whatsapp, cpf, addressJson, passwordHash, role, createdAt FROM users WHERE lower(email) = lower(?)'
+    )
+    .get(email.trim()) as Record<string, unknown> | undefined;
+  if (!row) return null;
+  return {
+    ...mapUserRow(row),
+    passwordHash: String(row.passwordHash),
+  };
+}
+
+export function getUserById(id: number): User | null {
+  const row = db
+    .prepare('SELECT id, name, email, whatsapp, cpf, addressJson, role, createdAt FROM users WHERE id = ?')
+    .get(id) as Record<string, unknown> | undefined;
+  return row ? mapUserRow(row) : null;
+}
+
+export function hasAdminUser(): boolean {
+  const row = db.prepare("SELECT COUNT(*) as count FROM users WHERE role = 'admin'").get() as { count: number };
+  return row.count > 0;
+}
+
+export function createUserRecord(params: {
+  name: string;
+  email: string;
+  whatsapp: string;
+  passwordHash: string;
+  role: UserRole;
+}): User {
+  const now = new Date().toISOString();
+  const res = db
+    .prepare('INSERT INTO users (name, email, whatsapp, passwordHash, role, createdAt) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(params.name, params.email.trim().toLowerCase(), params.whatsapp, params.passwordHash, params.role, now);
+  const created = getUserById(Number(res.lastInsertRowid));
+  if (!created) {
+    throw new Error('Failed to retrieve created user');
+  }
+  return created;
+}
