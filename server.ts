@@ -8,19 +8,25 @@ import { createServer as createViteServer } from 'vite';
 import {
   createUserRecord,
   db,
+  formatProductSku,
   getUserByEmail,
   getUserById,
   hasAdminUser,
+  hasUserUsedCoupon,
   listCouriers,
+  listCustomers,
   mapChanceRow,
   mapCouponRow,
   mapDeliveryTrackingInfo,
   mapOrderRow,
   mapPrizeRow,
   mapProductRow,
+  mapPublicProductRow,
   mapSettingsRow,
   mapSlideRow,
   mapSpinRow,
+  markUserWelcomeSeen,
+  recordCouponUsage,
 } from './server/db.ts';
 import {
   type AuthenticatedRequest,
@@ -39,15 +45,26 @@ import {
   verifyPassword,
 } from './server/auth.ts';
 import { sendPasswordResetEmail } from './server/mailer.ts';
+import {
+  getProductProfitDetail,
+  getProfitOverview,
+  recordProductCostSnapshot,
+  registerProductBatch,
+  updateProductProfitData,
+} from './server/profit.ts';
+import { runRzinChat, type RzinInputMessage } from './server/rzin.ts';
+import { computeTotalUnitCost } from './src/lib/profitMath.ts';
 import { validateGpsCoordinates } from './src/lib/tracking.ts';
 import type {
   CartItem,
   Coordinates,
+  Coupon,
   DeliveryAddress,
   OrderStatus,
   PaymentMethod,
   RoulettePrize,
   RouletteStateResponse,
+  User,
 } from './src/types.ts';
 
 const VALID_PAYMENTS: PaymentMethod[] = ['PIX', 'Cartão de crédito', 'Cartão de débito', 'Dinheiro'];
@@ -97,6 +114,12 @@ function pushUserEvent(userId: number, eventName: string, payload: unknown): voi
 function pushAdminEvent(eventName: string, payload: unknown): void {
   for (const adminId of sseAdminUserIds) {
     pushUserEvent(adminId, eventName, payload);
+  }
+}
+
+function pushBroadcastEvent(eventName: string, payload: unknown): void {
+  for (const userId of sseClients.keys()) {
+    pushUserEvent(userId, eventName, payload);
   }
 }
 
@@ -420,6 +443,59 @@ function expireOldCoupons(): void {
   db.prepare('UPDATE coupons SET active = 0 WHERE expiresAt IS NOT NULL AND expiresAt <= ? AND active = 1').run(
     now
   );
+}
+
+function evaluateCouponForUser(
+  coupon: Coupon,
+  user: User,
+  subtotal: number,
+  nowIso: string
+):
+  | { ok: true; discountAmount: number; freeShipping: boolean; message: string }
+  | { ok: false; status: number; message: string } {
+  const normalizedUserEmail = user.email.trim().toLowerCase();
+
+  if (coupon.ownerUserId !== null && coupon.ownerUserId !== user.id) {
+    return { ok: false, status: 403, message: 'Este cupom pertence a outro cliente.' };
+  }
+  if (coupon.allowedEmail !== null && normalizedUserEmail !== coupon.allowedEmail.trim().toLowerCase()) {
+    return { ok: false, status: 403, message: 'Este cupom é exclusivo para outro usuário.' };
+  }
+  if (coupon.expiresAt && coupon.expiresAt <= nowIso) {
+    return { ok: false, status: 400, message: 'Este cupom expirou.' };
+  }
+  if (!coupon.active) {
+    return { ok: false, status: 400, message: 'Este cupom está inativo.' };
+  }
+  if (coupon.maxUses !== null && coupon.usageCount >= coupon.maxUses) {
+    return { ok: false, status: 400, message: 'Este cupom já atingiu o limite de usos.' };
+  }
+  if (!coupon.allowMultipleUses && hasUserUsedCoupon(coupon.id, user.id)) {
+    return { ok: false, status: 400, message: 'Você já utilizou este cupom. Ele só pode ser usado uma vez.' };
+  }
+  if (subtotal < coupon.minOrderValue) {
+    return {
+      ok: false,
+      status: 400,
+      message: `Pedido mínimo de R$ ${coupon.minOrderValue.toFixed(2).replace('.', ',')} para usar este cupom.`,
+    };
+  }
+
+  let discountAmount = 0;
+  let freeShipping = false;
+  let message = '';
+  if (coupon.freeShipping || coupon.discountType === 'free_shipping') {
+    freeShipping = true;
+    message = `Cupom ${coupon.code} aplicado (Frete Grátis).`;
+  } else if (coupon.discountType === 'percent') {
+    discountAmount = roundMoney((subtotal * coupon.discountValue) / 100);
+    message = `Cupom ${coupon.code} aplicado (${coupon.discountValue}% OFF).`;
+  } else {
+    discountAmount = roundMoney(Math.min(subtotal, coupon.discountValue));
+    message = `Cupom ${coupon.code} aplicado (R$ ${coupon.discountValue.toFixed(2).replace('.', ',')} OFF).`;
+  }
+
+  return { ok: true, discountAmount, freeShipping, message };
 }
 
 function getUserRouletteState(userId: number): RouletteStateResponse {
@@ -947,6 +1023,13 @@ async function startServer(): Promise<void> {
     res.json({ user: updated });
   });
 
+  // Mark welcome first-purchase campaign as seen for the authenticated user
+  app.post('/api/account/welcome-seen', requireAuth, (req: AuthenticatedRequest, res) => {
+    const user = req.authUser!;
+    const updated = markUserWelcomeSeen(user.id);
+    res.json({ user: updated });
+  });
+
   // CEP lookup for instant address auto-fill
   app.get('/api/cep/:cep', requireAuth, async (req, res) => {
     const rawCep = String(req.params.cep || '');
@@ -966,14 +1049,14 @@ async function startServer(): Promise<void> {
   // Storefront Data
   app.get('/api/store', requireAuth, (_req, res) => {
     const productRows = db
-      .prepare('SELECT * FROM products WHERE active = 1 ORDER BY id DESC')
+      .prepare('SELECT * FROM products WHERE active = 1 AND archived = 0 ORDER BY id DESC')
       .all() as Record<string, unknown>[];
     const slideRows = db
       .prepare('SELECT * FROM carousel_slides WHERE active = 1 ORDER BY sortOrder ASC, id ASC')
       .all() as Record<string, unknown>[];
     const settingsRow = db.prepare('SELECT * FROM store_settings WHERE id = 1').get() as Record<string, unknown>;
 
-    const products = productRows.map(mapProductRow);
+    const products = productRows.map(mapPublicProductRow);
     const categories = ['Todos', ...Array.from(new Set(products.map((p) => p.category)))];
 
     res.json({
@@ -1011,10 +1094,45 @@ async function startServer(): Promise<void> {
     res.json(estimate);
   });
 
+  // RZIN AI Essence Consultant chat
+  app.post('/api/rzin/chat', requireAuth, async (req: AuthenticatedRequest, res) => {
+    const rawMessages = Array.isArray(req.body?.messages) ? req.body.messages : [];
+    const cleaned: RzinInputMessage[] = rawMessages
+      .slice(-20)
+      .map((m: unknown) => {
+        const obj = (m && typeof m === 'object' ? m : {}) as { role?: unknown; text?: unknown };
+        const role: 'user' | 'model' = obj.role === 'model' ? 'model' : 'user';
+        const text = typeof obj.text === 'string' ? obj.text.trim().slice(0, 2000) : '';
+        return { role, text };
+      })
+      .filter((m: RzinInputMessage) => m.text.length > 0);
+
+    if (cleaned.length === 0 || cleaned[cleaned.length - 1].role !== 'user') {
+      res.status(400).json({ error: 'Envie uma mensagem para conversar com o RZIN.' });
+      return;
+    }
+
+    try {
+      const result = await runRzinChat(cleaned);
+      res.json(result);
+    } catch (err: unknown) {
+      console.error('RZIN chat error:', err);
+      const message =
+        err instanceof Error ? err.message : 'Erro ao consultar o assistente RZIN.';
+      const status =
+        message.includes('GEMINI_API_KEY')
+          ? 503
+          : typeof err === 'object' && err !== null && 'status' in err && Number((err as { status?: unknown }).status) === 429
+            ? 429
+            : 500;
+      res.status(status).json({ error: message });
+    }
+  });
+
   // Validate discount / free-shipping coupon
   app.post('/api/coupons/validate', requireAuth, (req: AuthenticatedRequest, res) => {
     expireOldCoupons();
-    const userId = req.authUser!.id;
+    const user = req.authUser!;
     const code = typeof req.body?.code === 'string' ? req.body.code.trim().toUpperCase() : '';
     const subtotal = Number(req.body?.subtotal || 0);
 
@@ -1033,50 +1151,17 @@ async function startServer(): Promise<void> {
     }
 
     const coupon = mapCouponRow(row);
-    const nowIso = new Date().toISOString();
-
-    if (coupon.ownerUserId !== null && coupon.ownerUserId !== userId) {
-      res.status(403).json({ valid: false, message: 'Este cupom pertence a outro cliente.' });
+    const evaluation = evaluateCouponForUser(coupon, user, subtotal, new Date().toISOString());
+    if (evaluation.ok === false) {
+      res.status(evaluation.status).json({ valid: false, message: evaluation.message });
       return;
-    }
-    if (coupon.maxUses !== null && coupon.usageCount >= coupon.maxUses) {
-      res.status(400).json({ valid: false, message: 'Este cupom já foi utilizado.' });
-      return;
-    }
-    if (coupon.expiresAt && coupon.expiresAt <= nowIso) {
-      res.status(400).json({ valid: false, message: 'Este cupom expirou (validade de 7 dias encerrada).' });
-      return;
-    }
-    if (!coupon.active) {
-      res.status(400).json({ valid: false, message: 'Este cupom está inativo.' });
-      return;
-    }
-    if (subtotal < coupon.minOrderValue) {
-      res.status(400).json({
-        valid: false,
-        message: `Pedido mínimo de R$ ${coupon.minOrderValue.toFixed(2).replace('.', ',')} para usar este cupom.`,
-      });
-      return;
-    }
-
-    let discountAmount = 0;
-    let message = '';
-    if (coupon.freeShipping || coupon.discountType === 'free_shipping') {
-      discountAmount = 0;
-      message = `Cupom ${coupon.code} aplicado (Frete Grátis).`;
-    } else if (coupon.discountType === 'percent') {
-      discountAmount = roundMoney((subtotal * coupon.discountValue) / 100);
-      message = `Cupom ${coupon.code} aplicado (${coupon.discountValue}% OFF).`;
-    } else {
-      discountAmount = roundMoney(Math.min(subtotal, coupon.discountValue));
-      message = `Cupom ${coupon.code} aplicado (R$ ${coupon.discountValue.toFixed(2).replace('.', ',')} OFF).`;
     }
 
     res.json({
       valid: true,
       coupon,
-      discountAmount,
-      message,
+      discountAmount: evaluation.discountAmount,
+      message: evaluation.message,
     });
   });
 
@@ -1157,7 +1242,9 @@ async function startServer(): Promise<void> {
         return;
       }
 
-      const productRow = db.prepare('SELECT * FROM products WHERE id = ? AND active = 1').get(productId) as
+      const productRow = db
+        .prepare('SELECT * FROM products WHERE id = ? AND active = 1 AND archived = 0')
+        .get(productId) as
         | Record<string, unknown>
         | undefined;
       if (!productRow) {
@@ -1168,17 +1255,21 @@ async function startServer(): Promise<void> {
       const lineTotal = roundMoney(product.price * quantity);
       subtotal = roundMoney(subtotal + lineTotal);
 
+      const defaultVariation =
+        [product.variations[0], product.secondaryVariations?.[0]].filter(Boolean).join(' · ') || 'Padrão';
+
       verifiedItems.push({
         productId: product.id,
         name: product.name,
         price: product.price,
         imageUrl: product.imageUrl,
-        variation: variation || product.variations[0] || 'Padrão',
+        variation: variation || defaultVariation,
         quantity,
       });
     }
 
     let discountAmount = 0;
+    let appliedCouponId: number | null = null;
     let appliedCouponCode: string | null = null;
     let freeShippingByCoupon = false;
 
@@ -1188,26 +1279,20 @@ async function startServer(): Promise<void> {
       const couponRow = db.prepare('SELECT * FROM coupons WHERE upper(code) = ?').get(couponCodeInput) as
         | Record<string, unknown>
         | undefined;
-      if (couponRow) {
-        const coupon = mapCouponRow(couponRow);
-        const ownerOk = coupon.ownerUserId === null || coupon.ownerUserId === user.id;
-        const usesOk = coupon.maxUses === null || coupon.usageCount < coupon.maxUses;
-        const notExpired = !coupon.expiresAt || coupon.expiresAt > nowOrderIso;
-        if (coupon.active && ownerOk && usesOk && notExpired && subtotal >= coupon.minOrderValue) {
-          appliedCouponCode = coupon.code;
-          if (coupon.freeShipping || coupon.discountType === 'free_shipping') {
-            freeShippingByCoupon = true;
-          } else if (coupon.discountType === 'percent') {
-            discountAmount = roundMoney((subtotal * coupon.discountValue) / 100);
-          } else {
-            discountAmount = roundMoney(Math.min(subtotal, coupon.discountValue));
-          }
-          db.prepare('UPDATE coupons SET usageCount = usageCount + 1 WHERE id = ?').run(coupon.id);
-          if (coupon.maxUses !== null && coupon.usageCount + 1 >= coupon.maxUses) {
-            db.prepare('UPDATE coupons SET active = 0 WHERE id = ?').run(coupon.id);
-          }
-        }
+      if (!couponRow) {
+        res.status(400).json({ error: 'O cupom informado não existe mais.' });
+        return;
       }
+      const coupon = mapCouponRow(couponRow);
+      const evaluation = evaluateCouponForUser(coupon, user, subtotal, nowOrderIso);
+      if (evaluation.ok === false) {
+        res.status(evaluation.status).json({ error: evaluation.message });
+        return;
+      }
+      appliedCouponId = coupon.id;
+      appliedCouponCode = coupon.code;
+      discountAmount = evaluation.discountAmount;
+      freeShippingByCoupon = evaluation.freeShipping;
     }
 
     const subtotalAfterDiscount = Math.max(0, roundMoney(subtotal - discountAmount));
@@ -1223,48 +1308,85 @@ async function startServer(): Promise<void> {
     const destCoords =
       deliveryMethod === 'Entrega' ? await geocodeDeliveryAddress(address, coords) : null;
 
-    const maxOrderRow = db.prepare('SELECT COALESCE(MAX(orderNumber), 1000) as maxNum FROM orders').get() as {
-      maxNum: number;
-    };
-    const nextOrderNumber = Number(maxOrderRow.maxNum) + 1;
-    const now = new Date().toISOString();
+    let createdRow: Record<string, unknown>;
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const now = new Date().toISOString();
+      if (appliedCouponId !== null) {
+        const freshRow = db.prepare('SELECT * FROM coupons WHERE id = ?').get(appliedCouponId) as
+          | Record<string, unknown>
+          | undefined;
+        if (!freshRow) {
+          db.exec('ROLLBACK');
+          res.status(400).json({ error: 'O cupom informado não está mais disponível.' });
+          return;
+        }
+        const freshCoupon = mapCouponRow(freshRow);
+        const freshEval = evaluateCouponForUser(freshCoupon, user, subtotal, now);
+        if (freshEval.ok === false) {
+          db.exec('ROLLBACK');
+          res.status(freshEval.status).json({ error: freshEval.message });
+          return;
+        }
+        db.prepare('UPDATE coupons SET usageCount = usageCount + 1 WHERE id = ?').run(freshCoupon.id);
+        if (freshCoupon.maxUses !== null && freshCoupon.usageCount + 1 >= freshCoupon.maxUses) {
+          db.prepare('UPDATE coupons SET active = 0 WHERE id = ?').run(freshCoupon.id);
+        }
+      }
 
-    const insertResult = db
-      .prepare(`
-        INSERT INTO orders (
-          orderNumber, userId, customerName, customerWhatsapp, customerCpf,
-          deliveryMethod, addressJson, distanceKm, destLat, destLng, paymentMethod, changeFor, itemsJson,
-          subtotal, discountAmount, couponCode, shippingFee, shippingLabel, total,
-          status, rouletteGranted, notes, createdAt
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pendente', 0, ?, ?)
-      `)
-      .run(
-        nextOrderNumber,
-        user.id,
-        customerName,
-        customerWhatsapp,
-        customerCpf,
-        deliveryMethod,
-        address ? JSON.stringify(address) : null,
-        distanceKm,
-        destCoords ? destCoords.lat : null,
-        destCoords ? destCoords.lng : null,
-        paymentMethod,
-        paymentMethod === 'Dinheiro' ? changeFor : '',
-        JSON.stringify(verifiedItems),
-        subtotal,
-        discountAmount,
-        appliedCouponCode,
-        shippingFee,
-        shippingLabel,
-        total,
-        notes,
-        now
-      );
+      const maxOrderRow = db.prepare('SELECT COALESCE(MAX(orderNumber), 1000) as maxNum FROM orders').get() as {
+        maxNum: number;
+      };
+      const nextOrderNumber = Number(maxOrderRow.maxNum) + 1;
 
-    const createdRow = db
-      .prepare('SELECT * FROM orders WHERE id = ?')
-      .get(Number(insertResult.lastInsertRowid)) as Record<string, unknown>;
+      const insertResult = db
+        .prepare(`
+          INSERT INTO orders (
+            orderNumber, userId, customerName, customerWhatsapp, customerCpf,
+            deliveryMethod, addressJson, distanceKm, destLat, destLng, paymentMethod, changeFor, itemsJson,
+            subtotal, discountAmount, couponCode, shippingFee, shippingLabel, total,
+            status, rouletteGranted, notes, createdAt
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pendente', 0, ?, ?)
+        `)
+        .run(
+          nextOrderNumber,
+          user.id,
+          customerName,
+          customerWhatsapp,
+          customerCpf,
+          deliveryMethod,
+          address ? JSON.stringify(address) : null,
+          distanceKm,
+          destCoords ? destCoords.lat : null,
+          destCoords ? destCoords.lng : null,
+          paymentMethod,
+          paymentMethod === 'Dinheiro' ? changeFor : '',
+          JSON.stringify(verifiedItems),
+          subtotal,
+          discountAmount,
+          appliedCouponCode,
+          shippingFee,
+          shippingLabel,
+          total,
+          notes,
+          now
+        );
+
+      const newOrderId = Number(insertResult.lastInsertRowid);
+      if (appliedCouponId !== null) {
+        recordCouponUsage(appliedCouponId, user.id, newOrderId, now);
+      }
+
+      createdRow = db.prepare('SELECT * FROM orders WHERE id = ?').get(newOrderId) as Record<string, unknown>;
+      db.exec('COMMIT');
+    } catch (err) {
+      try {
+        db.exec('ROLLBACK');
+      } catch {
+        // ignore rollback failure
+      }
+      throw err;
+    }
 
     const createdOrder = mapOrderRow(createdRow);
     pushAdminEvent('order_updated', {
@@ -1607,8 +1729,8 @@ async function startServer(): Promise<void> {
         db.prepare(`
           INSERT INTO coupons (
             code, discountType, discountValue, minOrderValue, freeShipping,
-            ownerUserId, maxUses, expiresAt, active, usageCount, createdAt
-          ) VALUES (?, ?, ?, 0, ?, ?, 1, ?, 1, 0, ?)
+            ownerUserId, allowMultipleUses, maxUses, expiresAt, active, usageCount, createdAt
+          ) VALUES (?, ?, ?, 0, ?, ?, 0, 1, ?, 1, 0, ?)
         `).run(generatedCouponCode, discountType, discountValue, freeShipping, user.id, couponExpiresAt, nowIso);
       }
 
@@ -1659,9 +1781,9 @@ async function startServer(): Promise<void> {
 
   app.get('/api/admin/overview', requireAuth, requireAdmin, (_req, res) => {
     expireOldCoupons();
-    const products = (db.prepare('SELECT * FROM products ORDER BY id DESC').all() as Record<string, unknown>[]).map(
-      mapProductRow
-    );
+    const products = (
+      db.prepare('SELECT * FROM products WHERE archived = 0 ORDER BY id DESC').all() as Record<string, unknown>[]
+    ).map(mapProductRow);
     const coupons = (db.prepare('SELECT * FROM coupons ORDER BY id DESC').all() as Record<string, unknown>[]).map(
       mapCouponRow
     );
@@ -1673,6 +1795,7 @@ async function startServer(): Promise<void> {
     );
     const settingsRow = db.prepare('SELECT * FROM store_settings WHERE id = 1').get() as Record<string, unknown>;
     const couriers = listCouriers();
+    const customers = listCustomers();
 
     res.json({
       products,
@@ -1680,6 +1803,7 @@ async function startServer(): Promise<void> {
       slides,
       orders,
       couriers,
+      customers,
       settings: mapSettingsRow(settingsRow),
     });
   });
@@ -1747,8 +1871,12 @@ async function startServer(): Promise<void> {
     }
 
     const active = req.body?.active !== false ? 1 : 0;
-    db.prepare("UPDATE users SET active = ? WHERE id = ? AND role = 'courier'").run(active, id);
+    db.prepare("UPDATE users SET active = ? WHERE id = ? AND role = 'courier' AND COALESCE(archived, 0) = 0").run(
+      active,
+      id
+    );
     const updated = getUserById(id)!;
+    pushAdminEvent('store_updated', { entity: 'couriers', action: 'toggled', courierId: id });
     res.json({
       courier: {
         id: updated.id,
@@ -1759,6 +1887,124 @@ async function startServer(): Promise<void> {
         createdAt: updated.createdAt,
       },
     });
+  });
+
+  app.put('/api/admin/couriers/:id', requireAuth, requireAdmin, (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      res.status(400).json({ error: 'ID inválido.' });
+      return;
+    }
+    const existing = getUserById(id);
+    if (!existing || existing.role !== 'courier') {
+      res.status(404).json({ error: 'Motoboy não encontrado.' });
+      return;
+    }
+
+    const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    const whatsapp = typeof req.body?.whatsapp === 'string' ? req.body.whatsapp.trim() : '';
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+    const active = req.body?.active !== false ? 1 : 0;
+
+    if (name.length < 2) {
+      res.status(400).json({ error: 'Informe o nome do motoboy (mínimo 2 caracteres).' });
+      return;
+    }
+    if (!email || !email.includes('@') || email.length > 160) {
+      res.status(400).json({ error: 'Informe um e-mail válido para o motoboy.' });
+      return;
+    }
+    if (password && (password.length < 6 || password.length > 128)) {
+      res.status(400).json({ error: 'A nova senha do motoboy deve ter pelo menos 6 caracteres.' });
+      return;
+    }
+
+    const duplicate = getUserByEmail(email);
+    if (duplicate && duplicate.id !== id) {
+      res.status(409).json({ error: 'Já existe outra conta cadastrada com este e-mail.' });
+      return;
+    }
+
+    if (password) {
+      db.prepare(
+        "UPDATE users SET name = ?, email = ?, whatsapp = ?, active = ?, passwordHash = ? WHERE id = ? AND role = 'courier'"
+      ).run(name, email, whatsapp, active, hashPassword(password), id);
+    } else {
+      db.prepare(
+        "UPDATE users SET name = ?, email = ?, whatsapp = ?, active = ? WHERE id = ? AND role = 'courier'"
+      ).run(name, email, whatsapp, active, id);
+    }
+
+    // Keep assignedCourierName synced on active pending orders
+    db.prepare(
+      "UPDATE orders SET assignedCourierName = ? WHERE assignedCourierId = ? AND status NOT IN ('Entregue', 'Concluído', 'Cancelado')"
+    ).run(name, id);
+
+    const updated = getUserById(id)!;
+    pushAdminEvent('store_updated', { entity: 'couriers', action: 'updated', courierId: id });
+    res.json({
+      courier: {
+        id: updated.id,
+        name: updated.name,
+        email: updated.email,
+        whatsapp: updated.whatsapp,
+        active: updated.active !== false,
+        createdAt: updated.createdAt,
+      },
+    });
+  });
+
+  app.delete('/api/admin/couriers/:id', requireAuth, requireAdmin, (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      res.status(400).json({ error: 'ID inválido.' });
+      return;
+    }
+    const existing = getUserById(id);
+    if (!existing || existing.role !== 'courier') {
+      res.status(404).json({ error: 'Motoboy não encontrado.' });
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const orderRef = db
+      .prepare('SELECT 1 FROM orders WHERE assignedCourierId = ? LIMIT 1')
+      .get(id);
+    const trackingRef = db
+      .prepare('SELECT 1 FROM delivery_tracking_points WHERE courierId = ? LIMIT 1')
+      .get(id);
+
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      // Unassign from non-finalized active orders
+      db.prepare(
+        "UPDATE orders SET assignedCourierId = NULL, assignedCourierName = '', trackingActive = 0 WHERE assignedCourierId = ? AND status NOT IN ('Entregue', 'Concluído', 'Cancelado')"
+      ).run(id);
+
+      if (orderRef || trackingRef) {
+        const archivedEmail = `archived_${id}_${Date.now()}_${existing.email}`;
+        db.prepare(
+          "UPDATE users SET archived = 1, active = 0, archivedAt = ?, email = ? WHERE id = ? AND role = 'courier'"
+        ).run(now, archivedEmail, id);
+      } else {
+        db.prepare("DELETE FROM users WHERE id = ? AND role = 'courier'").run(id);
+      }
+      db.exec('COMMIT');
+    } catch (err) {
+      try {
+        db.exec('ROLLBACK');
+      } catch {
+        // ignore
+      }
+      console.error('Delete courier error:', err);
+      res.status(500).json({ error: 'Erro ao excluir motoboy.' });
+      return;
+    }
+
+    pushUserEvent(id, 'order_updated', { action: 'courier_removed' });
+    pushAdminEvent('store_updated', { entity: 'couriers', action: 'deleted', courierId: id });
+    res.json({ deleted: true });
   });
 
   app.patch('/api/admin/orders/:id/assign-courier', requireAuth, requireAdmin, (req, res) => {
@@ -1883,6 +2129,7 @@ async function startServer(): Promise<void> {
     ).run(label, shortLabel, discountValue, weight, active, id);
 
     const row = db.prepare('SELECT * FROM roulette_prizes WHERE id = ?').get(id) as Record<string, unknown>;
+    pushBroadcastEvent('store_updated', { entity: 'roulette', action: 'updated', prizeId: id });
     res.json({ prize: mapPrizeRow(row) });
   });
 
@@ -1904,18 +2151,35 @@ async function startServer(): Promise<void> {
     }
 
     const row = db.prepare('SELECT * FROM store_settings WHERE id = 1').get() as Record<string, unknown>;
+    pushBroadcastEvent('store_updated', { entity: 'store_status' });
     res.json({ settings: mapSettingsRow(row) });
   });
 
-  // Admin Products CRUD
-  app.post('/api/admin/products', requireAuth, requireAdmin, (req, res) => {
+  // Admin Products CRUD (automatically synced with R&P Profit Manager)
+  app.post('/api/admin/products', requireAuth, requireAdmin, (req: AuthenticatedRequest, res) => {
+    const rawSku = typeof req.body?.sku === 'string' ? req.body.sku.trim().toUpperCase().slice(0, 40) : '';
     const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
     const category = typeof req.body?.category === 'string' ? req.body.category.trim() : '';
     const description = typeof req.body?.description === 'string' ? req.body.description.trim() : '';
     const price = Number(req.body?.price);
+    const costPrice = roundMoney(Math.max(0, Number(req.body?.costPrice || 0)));
+    const freightCostUnit = roundMoney(Math.max(0, Number(req.body?.freightCostUnit || 0)));
+    const packagingCostUnit = roundMoney(Math.max(0, Number(req.body?.packagingCostUnit || 0)));
+    const otherCostUnit = roundMoney(Math.max(0, Number(req.body?.otherCostUnit || 0)));
+    const purchasedQuantity = Math.max(0, Math.round(Number(req.body?.purchasedQuantity || 0)));
+    const stockQuantity = Math.max(0, Math.round(Number(req.body?.stockQuantity ?? purchasedQuantity)));
     const imageUrl = typeof req.body?.imageUrl === 'string' ? req.body.imageUrl.trim() : '';
+    const variationLabel =
+      typeof req.body?.variationLabel === 'string' ? req.body.variationLabel.trim().slice(0, 60) : '';
     const variations = Array.isArray(req.body?.variations)
       ? req.body.variations.map((v: unknown) => String(v).trim()).filter(Boolean)
+      : [];
+    const secondaryVariationLabel =
+      typeof req.body?.secondaryVariationLabel === 'string'
+        ? req.body.secondaryVariationLabel.trim().slice(0, 60)
+        : '';
+    const secondaryVariations = Array.isArray(req.body?.secondaryVariations)
+      ? req.body.secondaryVariations.map((v: unknown) => String(v).trim()).filter(Boolean)
       : [];
     const active = req.body?.active !== false ? 1 : 0;
 
@@ -1929,17 +2193,108 @@ async function startServer(): Promise<void> {
     }
 
     const now = new Date().toISOString();
-    const result = db
-      .prepare(
-        'INSERT INTO products (name, category, description, price, imageUrl, variationsJson, active, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
-      )
-      .run(name, category, description, roundMoney(price), imageUrl, JSON.stringify(variations), active, now, now);
+    let newId = 0;
 
-    const row = db.prepare('SELECT * FROM products WHERE id = ?').get(Number(result.lastInsertRowid)) as Record<
-      string,
-      unknown
-    >;
-    res.status(201).json({ product: mapProductRow(row) });
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = db
+        .prepare(
+          `INSERT INTO products (
+            sku, name, category, description, price,
+            costPrice, freightCostUnit, packagingCostUnit, otherCostUnit,
+            purchasedQuantity, stockQuantity, archived,
+            imageUrl, variationLabel, variationsJson, secondaryVariationLabel, secondaryVariationsJson,
+            active, createdAt, updatedAt
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          rawSku,
+          name,
+          category,
+          description,
+          roundMoney(price),
+          costPrice,
+          freightCostUnit,
+          packagingCostUnit,
+          otherCostUnit,
+          purchasedQuantity,
+          stockQuantity,
+          imageUrl,
+          variationLabel,
+          JSON.stringify(variations),
+          secondaryVariationLabel,
+          JSON.stringify(secondaryVariations),
+          active,
+          now,
+          now
+        );
+
+      newId = Number(result.lastInsertRowid);
+      const finalSku = formatProductSku(newId, rawSku);
+      if (!rawSku) {
+        db.prepare('UPDATE products SET sku = ? WHERE id = ?').run(finalSku, newId);
+      }
+
+      if (purchasedQuantity > 0 && (costPrice > 0 || freightCostUnit > 0 || packagingCostUnit > 0 || otherCostUnit > 0)) {
+        const totalUnitCost = computeTotalUnitCost({
+          costPrice,
+          freightCostUnit,
+          packagingCostUnit,
+          otherCostUnit,
+        });
+        db.prepare(`
+          INSERT INTO product_cost_batches (
+            productId, quantityPurchased, remainingQuantity, unitPurchaseCost,
+            freightCostUnit, packagingCostUnit, otherCostUnit, totalUnitCost,
+            supplierNote, purchasedAt, createdAt, createdByAdminId
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          newId,
+          purchasedQuantity,
+          stockQuantity,
+          costPrice,
+          freightCostUnit,
+          packagingCostUnit,
+          otherCostUnit,
+          totalUnitCost,
+          'Cadastro inicial do produto',
+          now,
+          now,
+          req.authUser?.id ?? null
+        );
+      }
+
+      recordProductCostSnapshot({
+        productId: newId,
+        productNameSnapshot: name,
+        eventType: 'initial',
+        unitPurchaseCost: costPrice,
+        freightCostUnit,
+        packagingCostUnit,
+        otherCostUnit,
+        salePrice: roundMoney(price),
+        purchasedQuantity,
+        stockQuantity,
+        note: 'Produto cadastrado e sincronizado no R&P Profit Manager',
+        recordedAt: now,
+      });
+
+      db.exec('COMMIT');
+    } catch (err) {
+      try {
+        db.exec('ROLLBACK');
+      } catch {
+        // ignore
+      }
+      console.error('Create product error:', err);
+      res.status(500).json({ error: 'Erro ao cadastrar produto.' });
+      return;
+    }
+
+    const row = db.prepare('SELECT * FROM products WHERE id = ?').get(newId) as Record<string, unknown>;
+    const product = mapProductRow(row);
+    pushBroadcastEvent('products_updated', { action: 'created', productId: product.id });
+    res.status(201).json({ product });
   });
 
   app.put('/api/admin/products/:id', requireAuth, requireAdmin, (req, res) => {
@@ -1948,21 +2303,72 @@ async function startServer(): Promise<void> {
       res.status(400).json({ error: 'ID inválido.' });
       return;
     }
-    const existing = db.prepare('SELECT * FROM products WHERE id = ?').get(id) as Record<string, unknown> | undefined;
-    if (!existing) {
+    const existingRow = db
+      .prepare('SELECT * FROM products WHERE id = ? AND archived = 0')
+      .get(id) as Record<string, unknown> | undefined;
+    if (!existingRow) {
       res.status(404).json({ error: 'Produto não encontrado.' });
       return;
     }
 
+    const existing = mapProductRow(existingRow);
+    const sku =
+      typeof req.body?.sku === 'string' && req.body.sku.trim()
+        ? req.body.sku.trim().toUpperCase().slice(0, 40)
+        : formatProductSku(id, existing.sku);
     const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
     const category = typeof req.body?.category === 'string' ? req.body.category.trim() : '';
     const description = typeof req.body?.description === 'string' ? req.body.description.trim() : '';
     const price = Number(req.body?.price);
     const imageUrl = typeof req.body?.imageUrl === 'string' ? req.body.imageUrl.trim() : '';
+    const variationLabel =
+      req.body?.variationLabel !== undefined
+        ? typeof req.body.variationLabel === 'string'
+          ? req.body.variationLabel.trim().slice(0, 60)
+          : ''
+        : existing.variationLabel || '';
     const variations = Array.isArray(req.body?.variations)
       ? req.body.variations.map((v: unknown) => String(v).trim()).filter(Boolean)
       : [];
+    const secondaryVariationLabel =
+      req.body?.secondaryVariationLabel !== undefined
+        ? typeof req.body.secondaryVariationLabel === 'string'
+          ? req.body.secondaryVariationLabel.trim().slice(0, 60)
+          : ''
+        : existing.secondaryVariationLabel || '';
+    const secondaryVariations =
+      req.body?.secondaryVariations !== undefined
+        ? Array.isArray(req.body.secondaryVariations)
+          ? req.body.secondaryVariations.map((v: unknown) => String(v).trim()).filter(Boolean)
+          : []
+        : existing.secondaryVariations || [];
     const active = req.body?.active !== false ? 1 : 0;
+
+    // Preserve existing costs & stock when omitted; update if explicitly sent
+    const nextCostPrice =
+      req.body?.costPrice !== undefined
+        ? roundMoney(Math.max(0, Number(req.body.costPrice)))
+        : roundMoney(existing.costPrice || 0);
+    const nextFreightCost =
+      req.body?.freightCostUnit !== undefined
+        ? roundMoney(Math.max(0, Number(req.body.freightCostUnit)))
+        : roundMoney(existing.freightCostUnit || 0);
+    const nextPackagingCost =
+      req.body?.packagingCostUnit !== undefined
+        ? roundMoney(Math.max(0, Number(req.body.packagingCostUnit)))
+        : roundMoney(existing.packagingCostUnit || 0);
+    const nextOtherCost =
+      req.body?.otherCostUnit !== undefined
+        ? roundMoney(Math.max(0, Number(req.body.otherCostUnit)))
+        : roundMoney(existing.otherCostUnit || 0);
+    const nextPurchasedQty =
+      req.body?.purchasedQuantity !== undefined
+        ? Math.max(0, Math.round(Number(req.body.purchasedQuantity)))
+        : Math.max(0, Math.round(Number(existing.purchasedQuantity || 0)));
+    const nextStockQty =
+      req.body?.stockQuantity !== undefined
+        ? Math.max(0, Math.round(Number(req.body.stockQuantity)))
+        : Math.max(0, Math.round(Number(existing.stockQuantity || 0)));
 
     if (!name || !category || !Number.isFinite(price) || price <= 0) {
       res.status(400).json({ error: 'Nome, categoria e preço positivo são obrigatórios.' });
@@ -1973,13 +2379,85 @@ async function startServer(): Promise<void> {
       return;
     }
 
+    const roundedPrice = roundMoney(price);
+    const priceChanged = roundedPrice !== roundMoney(existing.price);
+    const costChanged =
+      nextCostPrice !== roundMoney(existing.costPrice || 0) ||
+      nextFreightCost !== roundMoney(existing.freightCostUnit || 0) ||
+      nextPackagingCost !== roundMoney(existing.packagingCostUnit || 0) ||
+      nextOtherCost !== roundMoney(existing.otherCostUnit || 0) ||
+      nextPurchasedQty !== Math.round(Number(existing.purchasedQuantity || 0)) ||
+      nextStockQty !== Math.round(Number(existing.stockQuantity || 0));
+
     const now = new Date().toISOString();
-    db.prepare(
-      'UPDATE products SET name = ?, category = ?, description = ?, price = ?, imageUrl = ?, variationsJson = ?, active = ?, updatedAt = ? WHERE id = ?'
-    ).run(name, category, description, roundMoney(price), imageUrl, JSON.stringify(variations), active, now, id);
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      db.prepare(
+        `UPDATE products SET
+          sku = ?, name = ?, category = ?, description = ?, price = ?,
+          costPrice = ?, freightCostUnit = ?, packagingCostUnit = ?, otherCostUnit = ?,
+          purchasedQuantity = ?, stockQuantity = ?,
+          imageUrl = ?, variationLabel = ?, variationsJson = ?, secondaryVariationLabel = ?, secondaryVariationsJson = ?,
+          active = ?, updatedAt = ?
+        WHERE id = ?`
+      ).run(
+        sku,
+        name,
+        category,
+        description,
+        roundedPrice,
+        nextCostPrice,
+        nextFreightCost,
+        nextPackagingCost,
+        nextOtherCost,
+        nextPurchasedQty,
+        nextStockQty,
+        imageUrl,
+        variationLabel,
+        JSON.stringify(variations),
+        secondaryVariationLabel,
+        JSON.stringify(secondaryVariations),
+        active,
+        now,
+        id
+      );
+
+      if (priceChanged || costChanged) {
+        recordProductCostSnapshot({
+          productId: id,
+          productNameSnapshot: name,
+          eventType: priceChanged && !costChanged ? 'price_change' : 'manual_edit',
+          unitPurchaseCost: nextCostPrice,
+          freightCostUnit: nextFreightCost,
+          packagingCostUnit: nextPackagingCost,
+          otherCostUnit: nextOtherCost,
+          salePrice: roundedPrice,
+          purchasedQuantity: nextPurchasedQty,
+          stockQuantity: nextStockQty,
+          note:
+            priceChanged && !costChanged
+              ? 'Preço de venda atualizado no cadastro principal (custo preservado)'
+              : 'Produto e informações financeiras atualizados no cadastro principal',
+          recordedAt: now,
+        });
+      }
+
+      db.exec('COMMIT');
+    } catch (err) {
+      try {
+        db.exec('ROLLBACK');
+      } catch {
+        // ignore
+      }
+      console.error('Update product error:', err);
+      res.status(500).json({ error: 'Erro ao atualizar produto.' });
+      return;
+    }
 
     const row = db.prepare('SELECT * FROM products WHERE id = ?').get(id) as Record<string, unknown>;
-    res.json({ product: mapProductRow(row) });
+    const product = mapProductRow(row);
+    pushBroadcastEvent('products_updated', { action: 'updated', productId: product.id });
+    res.json({ product });
   });
 
   app.delete('/api/admin/products/:id', requireAuth, requireAdmin, (req, res) => {
@@ -1988,9 +2466,147 @@ async function startServer(): Promise<void> {
       res.status(400).json({ error: 'ID inválido.' });
       return;
     }
-    db.prepare('DELETE FROM products WHERE id = ?').run(id);
-    res.json({ deleted: true });
+    const existingRow = db
+      .prepare('SELECT * FROM products WHERE id = ? AND archived = 0')
+      .get(id) as Record<string, unknown> | undefined;
+    if (!existingRow) {
+      res.status(404).json({ error: 'Produto não encontrado.' });
+      return;
+    }
+
+    const existing = mapProductRow(existingRow);
+    const now = new Date().toISOString();
+
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      // Soft-archive to remove from active storefront & Profit Manager inventory while preserving cost & sales history
+      db.prepare('UPDATE products SET archived = 1, active = 0, archivedAt = ?, updatedAt = ? WHERE id = ?').run(
+        now,
+        now,
+        id
+      );
+
+      recordProductCostSnapshot({
+        productId: id,
+        productNameSnapshot: existing.name,
+        eventType: 'archived',
+        unitPurchaseCost: Number(existing.costPrice || 0),
+        freightCostUnit: Number(existing.freightCostUnit || 0),
+        packagingCostUnit: Number(existing.packagingCostUnit || 0),
+        otherCostUnit: Number(existing.otherCostUnit || 0),
+        salePrice: existing.price,
+        purchasedQuantity: Number(existing.purchasedQuantity || 0),
+        stockQuantity: Number(existing.stockQuantity || 0),
+        note: 'Produto removido do catálogo ativo (histórico preservado)',
+        recordedAt: now,
+      });
+
+      db.exec('COMMIT');
+    } catch (err) {
+      try {
+        db.exec('ROLLBACK');
+      } catch {
+        // ignore
+      }
+      console.error('Archive product error:', err);
+      res.status(500).json({ error: 'Erro ao remover produto.' });
+      return;
+    }
+
+    pushBroadcastEvent('products_updated', { action: 'archived', productId: id });
+    res.json({ deleted: true, archived: true });
   });
+
+  // ================= R&P PROFIT MANAGER (ADMIN ONLY) =================
+
+  app.get('/api/admin/profit/overview', requireAuth, requireAdmin, (_req, res) => {
+    try {
+      res.json(getProfitOverview());
+    } catch (err) {
+      console.error('Profit overview error:', err);
+      res.status(500).json({ error: 'Erro ao carregar dados de rentabilidade.' });
+    }
+  });
+
+  app.get('/api/admin/profit/products/:id', requireAuth, requireAdmin, (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      res.status(400).json({ error: 'ID de produto inválido.' });
+      return;
+    }
+    const detail = getProductProfitDetail(id);
+    if (!detail) {
+      res.status(404).json({ error: 'Produto não encontrado.' });
+      return;
+    }
+    res.json(detail);
+  });
+
+  app.put('/api/admin/profit/products/:id', requireAuth, requireAdmin, (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      res.status(400).json({ error: 'ID de produto inválido.' });
+      return;
+    }
+    try {
+      const updated = updateProductProfitData(id, {
+        sku: typeof req.body?.sku === 'string' ? req.body.sku : undefined,
+        price: req.body?.price !== undefined ? Number(req.body.price) : undefined,
+        costPrice: req.body?.costPrice !== undefined ? Number(req.body.costPrice) : undefined,
+        freightCostUnit:
+          req.body?.freightCostUnit !== undefined ? Number(req.body.freightCostUnit) : undefined,
+        packagingCostUnit:
+          req.body?.packagingCostUnit !== undefined ? Number(req.body.packagingCostUnit) : undefined,
+        otherCostUnit: req.body?.otherCostUnit !== undefined ? Number(req.body.otherCostUnit) : undefined,
+        purchasedQuantity:
+          req.body?.purchasedQuantity !== undefined ? Number(req.body.purchasedQuantity) : undefined,
+        stockQuantity: req.body?.stockQuantity !== undefined ? Number(req.body.stockQuantity) : undefined,
+        note: typeof req.body?.note === 'string' ? req.body.note : undefined,
+      });
+      pushBroadcastEvent('products_updated', { action: 'profit_updated', productId: id });
+      res.json({ product: updated });
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Erro ao atualizar dados de rentabilidade do produto.',
+      });
+    }
+  });
+
+  app.post(
+    '/api/admin/profit/products/:id/batches',
+    requireAuth,
+    requireAdmin,
+    (req: AuthenticatedRequest, res) => {
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id)) {
+        res.status(400).json({ error: 'ID de produto inválido.' });
+        return;
+      }
+      try {
+        const result = registerProductBatch(
+          id,
+          {
+            quantityPurchased: Number(req.body?.quantityPurchased),
+            unitPurchaseCost: Number(req.body?.unitPurchaseCost),
+            freightCostUnit:
+              req.body?.freightCostUnit !== undefined ? Number(req.body.freightCostUnit) : 0,
+            packagingCostUnit:
+              req.body?.packagingCostUnit !== undefined ? Number(req.body.packagingCostUnit) : 0,
+            otherCostUnit: req.body?.otherCostUnit !== undefined ? Number(req.body.otherCostUnit) : 0,
+            supplierNote: typeof req.body?.supplierNote === 'string' ? req.body.supplierNote : '',
+            purchasedAt: typeof req.body?.purchasedAt === 'string' ? req.body.purchasedAt : undefined,
+          },
+          req.authUser?.id
+        );
+        pushBroadcastEvent('products_updated', { action: 'batch_registered', productId: id });
+        res.status(201).json(result);
+      } catch (err) {
+        res.status(400).json({
+          error: err instanceof Error ? err.message : 'Erro ao registrar lote de compra.',
+        });
+      }
+    }
+  );
 
   // Admin Coupons CRUD
   app.post('/api/admin/coupons', requireAuth, requireAdmin, (req, res) => {
@@ -2001,6 +2617,10 @@ async function startServer(): Promise<void> {
     const minOrderValue = Number(req.body?.minOrderValue || 0);
     const freeShipping = discountType === 'free_shipping' ? 1 : 0;
     const active = req.body?.active !== false ? 1 : 0;
+    const rawAllowedEmail =
+      typeof req.body?.allowedEmail === 'string' ? req.body.allowedEmail.trim().toLowerCase() : '';
+    const allowedEmail = rawAllowedEmail ? rawAllowedEmail : null;
+    const allowMultipleUses = req.body?.allowMultipleUses !== false ? 1 : 0;
 
     if (!code || code.length < 2 || (discountType !== 'free_shipping' && (!Number.isFinite(discountValue) || discountValue <= 0))) {
       res.status(400).json({ error: 'Código e valor de desconto válidos são obrigatórios.' });
@@ -2008,6 +2628,10 @@ async function startServer(): Promise<void> {
     }
     if (discountType === 'percent' && discountValue > 100) {
       res.status(400).json({ error: 'Desconto percentual não pode exceder 100%.' });
+      return;
+    }
+    if (allowedEmail && (!allowedEmail.includes('@') || !allowedEmail.includes('.') || allowedEmail.length > 160)) {
+      res.status(400).json({ error: 'Informe um e-mail válido para restringir o cupom.' });
       return;
     }
 
@@ -2020,14 +2644,25 @@ async function startServer(): Promise<void> {
     const now = new Date().toISOString();
     const result = db
       .prepare(
-        'INSERT INTO coupons (code, discountType, discountValue, minOrderValue, freeShipping, active, usageCount, createdAt) VALUES (?, ?, ?, ?, ?, ?, 0, ?)'
+        'INSERT INTO coupons (code, discountType, discountValue, minOrderValue, freeShipping, allowedEmail, allowMultipleUses, active, usageCount, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)'
       )
-      .run(code, discountType, roundMoney(discountValue), Math.max(0, roundMoney(minOrderValue)), freeShipping, active, now);
+      .run(
+        code,
+        discountType,
+        roundMoney(discountValue),
+        Math.max(0, roundMoney(minOrderValue)),
+        freeShipping,
+        allowedEmail,
+        allowMultipleUses,
+        active,
+        now
+      );
 
     const row = db.prepare('SELECT * FROM coupons WHERE id = ?').get(Number(result.lastInsertRowid)) as Record<
       string,
       unknown
     >;
+    pushAdminEvent('store_updated', { entity: 'coupons', action: 'created' });
     res.status(201).json({ coupon: mapCouponRow(row) });
   });
 
@@ -2037,7 +2672,7 @@ async function startServer(): Promise<void> {
       res.status(400).json({ error: 'ID inválido.' });
       return;
     }
-    const existing = db.prepare('SELECT * FROM coupons WHERE id = ?').get(id);
+    const existing = db.prepare('SELECT * FROM coupons WHERE id = ?').get(id) as Record<string, unknown> | undefined;
     if (!existing) {
       res.status(404).json({ error: 'Cupom não encontrado.' });
       return;
@@ -2050,6 +2685,10 @@ async function startServer(): Promise<void> {
     const minOrderValue = Number(req.body?.minOrderValue || 0);
     const freeShipping = discountType === 'free_shipping' ? 1 : 0;
     const active = req.body?.active !== false ? 1 : 0;
+    const rawAllowedEmail =
+      typeof req.body?.allowedEmail === 'string' ? req.body.allowedEmail.trim().toLowerCase() : '';
+    const allowedEmail = rawAllowedEmail ? rawAllowedEmail : null;
+    const allowMultipleUses = req.body?.allowMultipleUses !== false ? 1 : 0;
 
     if (!code || (discountType !== 'free_shipping' && (!Number.isFinite(discountValue) || discountValue <= 0))) {
       res.status(400).json({ error: 'Código e valor de desconto válidos são obrigatórios.' });
@@ -2059,6 +2698,10 @@ async function startServer(): Promise<void> {
       res.status(400).json({ error: 'Desconto percentual não pode exceder 100%.' });
       return;
     }
+    if (allowedEmail && (!allowedEmail.includes('@') || !allowedEmail.includes('.') || allowedEmail.length > 160)) {
+      res.status(400).json({ error: 'Informe um e-mail válido para restringir o cupom.' });
+      return;
+    }
 
     const duplicate = db.prepare('SELECT id FROM coupons WHERE upper(code) = ? AND id != ?').get(code, id);
     if (duplicate) {
@@ -2066,11 +2709,29 @@ async function startServer(): Promise<void> {
       return;
     }
 
+    const existingCoupon = mapCouponRow(existing);
+    const nextMaxUses =
+      existingCoupon.ownerUserId === null && allowMultipleUses === 1 && existingCoupon.maxUses === 1
+        ? null
+        : existingCoupon.maxUses;
+
     db.prepare(
-      'UPDATE coupons SET code = ?, discountType = ?, discountValue = ?, minOrderValue = ?, freeShipping = ?, active = ? WHERE id = ?'
-    ).run(code, discountType, roundMoney(discountValue), Math.max(0, roundMoney(minOrderValue)), freeShipping, active, id);
+      'UPDATE coupons SET code = ?, discountType = ?, discountValue = ?, minOrderValue = ?, freeShipping = ?, allowedEmail = ?, allowMultipleUses = ?, maxUses = ?, active = ? WHERE id = ?'
+    ).run(
+      code,
+      discountType,
+      roundMoney(discountValue),
+      Math.max(0, roundMoney(minOrderValue)),
+      freeShipping,
+      allowedEmail,
+      allowMultipleUses,
+      nextMaxUses,
+      active,
+      id
+    );
 
     const row = db.prepare('SELECT * FROM coupons WHERE id = ?').get(id) as Record<string, unknown>;
+    pushAdminEvent('store_updated', { entity: 'coupons', action: 'updated', couponId: id });
     res.json({ coupon: mapCouponRow(row) });
   });
 
@@ -2080,7 +2741,9 @@ async function startServer(): Promise<void> {
       res.status(400).json({ error: 'ID inválido.' });
       return;
     }
+    db.prepare('DELETE FROM coupon_usages WHERE couponId = ?').run(id);
     db.prepare('DELETE FROM coupons WHERE id = ?').run(id);
+    pushAdminEvent('store_updated', { entity: 'coupons', action: 'deleted', couponId: id });
     res.json({ deleted: true });
   });
 
@@ -2115,6 +2778,7 @@ async function startServer(): Promise<void> {
       string,
       unknown
     >;
+    pushBroadcastEvent('store_updated', { entity: 'carousel', action: 'created' });
     res.status(201).json({ slide: mapSlideRow(row) });
   });
 
@@ -2154,6 +2818,7 @@ async function startServer(): Promise<void> {
     ).run(tag, title, subtitle, ctaText, targetCategory, imageUrl, sortOrder, active, id);
 
     const row = db.prepare('SELECT * FROM carousel_slides WHERE id = ?').get(id) as Record<string, unknown>;
+    pushBroadcastEvent('store_updated', { entity: 'carousel', action: 'updated', slideId: id });
     res.json({ slide: mapSlideRow(row) });
   });
 
@@ -2164,6 +2829,7 @@ async function startServer(): Promise<void> {
       return;
     }
     db.prepare('DELETE FROM carousel_slides WHERE id = ?').run(id);
+    pushBroadcastEvent('store_updated', { entity: 'carousel', action: 'deleted', slideId: id });
     res.json({ deleted: true });
   });
 
@@ -2244,6 +2910,7 @@ async function startServer(): Promise<void> {
     );
 
     const row = db.prepare('SELECT * FROM store_settings WHERE id = 1').get() as Record<string, unknown>;
+    pushBroadcastEvent('store_updated', { entity: 'settings' });
     res.json({ settings: mapSettingsRow(row) });
   });
 
