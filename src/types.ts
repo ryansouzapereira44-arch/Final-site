@@ -36,6 +36,7 @@ export interface Product {
   name: string;
   category: string;
   description: string;
+  badgeLabel?: string;
   price: number;
   costPrice?: number;
   freightCostUnit?: number;
@@ -50,6 +51,7 @@ export interface Product {
   variations: string[];
   secondaryVariationLabel?: string;
   secondaryVariations?: string[];
+  variationStock?: Record<string, number>;
   active: boolean;
   createdAt: string;
   updatedAt: string;
@@ -59,6 +61,15 @@ export interface CustomerSummary {
   id: number;
   name: string;
   email: string;
+}
+
+export interface ProductSuggestion {
+  id: number;
+  userId: number;
+  customerName: string;
+  customerEmail: string;
+  suggestion: string;
+  createdAt: string;
 }
 
 export interface Coupon {
@@ -85,9 +96,13 @@ export interface CarouselSlide {
   subtitle: string;
   ctaText: string;
   targetCategory: string;
+  linkUrl?: string;
   imageUrl: string;
+  storagePath?: string;
   sortOrder: number;
   active: boolean;
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 export type ShippingMode = 'per_km' | 'fixed' | 'to_confirm';
@@ -117,6 +132,12 @@ export interface CartItem {
   price: number;
   imageUrl: string;
   variation: string;
+  variationDetails?: {
+    primaryLabel?: string;
+    primaryValue?: string;
+    secondaryLabel?: string;
+    secondaryValue?: string;
+  };
   quantity: number;
 }
 
@@ -185,6 +206,7 @@ export interface Order {
   total: number;
   status: OrderStatus;
   rouletteGranted: boolean;
+  stockDeducted?: boolean;
   notes: string;
   createdAt: string;
   assignedCourierId: number | null;
@@ -414,3 +436,66 @@ export interface ProfitOverviewResponse {
   historicalSales: HistoricalSaleProfitSummary;
   costingMethodNote: string;
 }
+
+export type LoyalCustomerPeriod = 'today' | '7d' | '30d' | 'current_month' | 'all' | 'custom';
+export type LoyalCustomerSortBy = 'total_spent' | 'orders_count' | 'avg_ticket' | 'last_order_at';
+
+export interface LoyalCustomerRow {
+  rank: number;
+  userId: number;
+  name: string;
+  email: string;
+  whatsapp: string;
+  mainNeighborhood: string;
+  ordersCount: number;
+  totalSpent: number;
+  avgTicket: number;
+  lastOrderAt: string;
+  topProduct: string;
+  isInactive30d: boolean;
+}
+
+export interface LoyalCustomersSummary {
+  totalCustomers: number;
+  recurringCustomers: number;
+  overallAvgTicket: number;
+  top10Revenue: number;
+}
+
+export interface LoyalCustomersResponse {
+  customers: LoyalCustomerRow[];
+  summary: LoyalCustomersSummary;
+  neighborhoods: string[];
+  pagination: {
+    page: number;
+    pageSize: number;
+    totalCount: number;
+    totalPages: number;
+  };
+}
+
+export interface LoyalCustomerDetail {
+  customer: {
+    userId: number;
+    name: string;
+    email: string;
+    whatsapp: string;
+    cpf: string;
+    mainNeighborhood: string;
+    ordersCount: number;
+    totalSpent: number;
+    avgTicket: number;
+    lastOrderAt: string;
+    isInactive30d: boolean;
+  };
+  addresses: DeliveryAddress[];
+  favoriteProducts: {
+    productName: string;
+    variation: string;
+    totalQuantity: number;
+    totalSpent: number;
+  }[];
+  orders: Order[];
+}
+
+
