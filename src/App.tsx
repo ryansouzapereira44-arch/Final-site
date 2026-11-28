@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Gift, Lock, X } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ExternalLink, Gift, Lock, Star, X } from 'lucide-react';
 import { AdminPanel } from './components/AdminPanel';
 import { AuthGate } from './components/AuthGate';
 import { BrandLogoSVG } from './components/BrandMark';
@@ -18,6 +18,8 @@ import { Header, type AppView } from './components/Header';
 import { MyAccountView, type AccountSubTab } from './components/MyAccountView';
 import { MyOrdersView } from './components/MyOrdersView';
 import { OrderConfirmationModal } from './components/OrderConfirmationModal';
+import { RzinAssistant } from './components/RzinAssistant';
+import { WelcomeCampaignModal } from './components/WelcomeCampaignModal';
 import { api } from './lib/api';
 import type {
   CarouselSlide,
@@ -114,6 +116,9 @@ export default function App() {
   const [trackingReturnView, setTrackingReturnView] = useState<'account' | 'orders' | 'admin'>('account');
   const [liveTrackingUpdate, setLiveTrackingUpdate] = useState<DeliveryTrackingInfo | null>(null);
   const [liveSyncCounter, setLiveSyncCounter] = useState(0);
+  const [rzinOpen, setRzinOpen] = useState(false);
+  const [welcomeModalOpen, setWelcomeModalOpen] = useState(false);
+  const welcomeHandledUserIdRef = useRef<number | null>(null);
 
   const loadStoreData = useCallback(async (authToken: string | null) => {
     setStoreLoading(true);
@@ -209,6 +214,30 @@ export default function App() {
     };
   }, [loadStoreData, loadMyOrders, applyUserProfileToDraft]);
 
+  // First-login welcome campaign modal (controlled via DB user.welcomeCampaignSeen)
+  useEffect(() => {
+    if (!user || user.role === 'courier') {
+      setWelcomeModalOpen(false);
+      return;
+    }
+    if (user.welcomeCampaignSeen === false && welcomeHandledUserIdRef.current !== user.id) {
+      welcomeHandledUserIdRef.current = user.id;
+      setWelcomeModalOpen(true);
+      void api
+        .markWelcomeSeen(token)
+        .then((res) => {
+          if (res.user) {
+            setUser(res.user);
+          } else {
+            setUser((prev) => (prev ? { ...prev, welcomeCampaignSeen: true } : prev));
+          }
+        })
+        .catch(() => {
+          welcomeHandledUserIdRef.current = null;
+        });
+    }
+  }, [user, token]);
+
   // Real-time SSE sync: updates ROLETA chances, order statuses & live delivery tracking
   useEffect(() => {
     if (!user) return;
@@ -251,11 +280,23 @@ export default function App() {
       }
       setLiveSyncCounter((c) => c + 1);
     });
+    es.addEventListener('products_updated', () => {
+      if (user.role !== 'courier') {
+        void loadStoreData(token);
+      }
+      setLiveSyncCounter((c) => c + 1);
+    });
+    es.addEventListener('store_updated', () => {
+      if (user.role !== 'courier') {
+        void loadStoreData(token);
+      }
+      setLiveSyncCounter((c) => c + 1);
+    });
 
     return () => {
       es.close();
     };
-  }, [user, token, loadRouletteState, loadMyOrders]);
+  }, [user, token, loadRouletteState, loadMyOrders, loadStoreData]);
 
   function handleAuthenticated(loggedUser: User, authToken: string) {
     setUser(loggedUser);
@@ -288,6 +329,9 @@ export default function App() {
     setSelectedTrackingOrderId(null);
     setLiveTrackingUpdate(null);
     setCheckoutDraft(INITIAL_DRAFT);
+    setRzinOpen(false);
+    setWelcomeModalOpen(false);
+    welcomeHandledUserIdRef.current = null;
     setActiveView('store');
     api
       .getAuthStatus()
@@ -442,6 +486,33 @@ export default function App() {
     }
   }
 
+  function handleCloseWelcomeModal() {
+    setWelcomeModalOpen(false);
+    if (user && user.welcomeCampaignSeen === false) {
+      void api
+        .markWelcomeSeen(token)
+        .then((res) => {
+          if (res.user) setUser(res.user);
+        })
+        .catch(() => {});
+    }
+  }
+
+  function handleStartShoppingFromWelcome() {
+    handleCloseWelcomeModal();
+    setConfirmedOrder(null);
+    setSelectedCategory('Todos');
+    setActiveView('store');
+    window.setTimeout(() => {
+      const el = document.getElementById('catalogo-section');
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth' });
+      } else {
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      }
+    }, 60);
+  }
+
   if (authChecking) {
     return (
       <div className="min-h-screen bg-black text-white flex flex-col items-center justify-center gap-4">
@@ -477,6 +548,7 @@ export default function App() {
         cartSubtotal={cartSubtotal}
         rouletteAvailableCount={rouletteState?.chances.available ?? 0}
         onNavigate={handleNavigate}
+        onOpenRzin={() => setRzinOpen(true)}
         onLogout={() => void handleLogout()}
       />
 
@@ -542,6 +614,7 @@ export default function App() {
                   selectedCategory={selectedCategory}
                   onSelectCategory={setSelectedCategory}
                   onAddToCart={handleAddToCart}
+                  onOpenRzin={() => setRzinOpen(true)}
                 />
               </>
             )}
@@ -625,10 +698,45 @@ export default function App() {
       </main>
 
       {activeView !== 'checkout' && (
-        <footer className="border-t border-white/10 mt-12 py-8 px-4 sm:px-6 text-center text-xs text-[#9E9E9E]">
-          <p className="font-semibold text-white">R&amp;P TABACARIA</p>
-          <p className="mt-1">Qualidade · Variedade · Sempre com você</p>
+        <footer className="border-t border-white/10 mt-12 py-8 px-4 sm:px-6 text-center text-xs text-[#9E9E9E] space-y-4">
+          <div>
+            <p className="font-semibold text-white">R&amp;P TABACARIA</p>
+            <p className="mt-1">Qualidade · Variedade · Sempre com você</p>
+          </div>
+          <div>
+            <a
+              href="https://share.google/Wvlt5sHGVC4AsvTdz"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center justify-center gap-2 h-10 px-5 rounded-xl border border-white/20 bg-[#0C0C0C] text-xs font-bold text-white hover:bg-white hover:text-black transition-colors"
+            >
+              <Star className="w-4 h-4 text-amber-400 fill-amber-400" />
+              <span>Avaliar atendimento no Google</span>
+              <ExternalLink className="w-3.5 h-3.5 opacity-70" />
+            </a>
+          </div>
         </footer>
+      )}
+
+      {user.role !== 'courier' && (
+        <RzinAssistant
+          token={token}
+          products={products}
+          isOpen={rzinOpen}
+          hideFloatingTrigger={activeView === 'checkout' || welcomeModalOpen}
+          onOpen={() => setRzinOpen(true)}
+          onClose={() => setRzinOpen(false)}
+          onAddToCart={handleAddToCart}
+        />
+      )}
+
+      {user.role !== 'courier' && (
+        <WelcomeCampaignModal
+          isOpen={welcomeModalOpen}
+          customerName={user.name}
+          onClose={handleCloseWelcomeModal}
+          onStartShopping={handleStartShoppingFromWelcome}
+        />
       )}
     </div>
   );
