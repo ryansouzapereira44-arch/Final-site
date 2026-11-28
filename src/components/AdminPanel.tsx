@@ -15,17 +15,21 @@ import {
   Store,
   Tag,
   Trash2,
+  TrendingUp,
   UserPlus,
   X,
 } from 'lucide-react';
 import { api, type AdminRouletteResponse } from '../lib/api';
 import { formatBRL, formatCepInput, formatDateTimeBR, formatWhatsappInput } from '../lib/format';
 import { compressImageFileToDataUrl } from '../lib/imageUpload';
+import { computeProductProfitMetrics } from '../lib/profitMath';
 import { isTrackingAvailableForOrder } from '../lib/tracking';
+import { ProfitManagerModule } from './profit/ProfitManagerModule';
 import type {
   CarouselSlide,
   CourierSummary,
   Coupon,
+  CustomerSummary,
   Order,
   OrderStatus,
   Product,
@@ -42,7 +46,15 @@ interface AdminPanelProps {
   onOpenTracking: (orderId: number) => void;
 }
 
-type AdminTab = 'orders' | 'couriers' | 'products' | 'coupons' | 'carousel' | 'roulette' | 'settings';
+type AdminTab =
+  | 'orders'
+  | 'couriers'
+  | 'products'
+  | 'profit'
+  | 'coupons'
+  | 'carousel'
+  | 'roulette'
+  | 'settings';
 
 const ORDER_STATUSES: OrderStatus[] = [
   'Pendente',
@@ -77,6 +89,7 @@ export function AdminPanel({
 
   const [orders, setOrders] = useState<Order[]>([]);
   const [couriers, setCouriers] = useState<CourierSummary[]>([]);
+  const [customers, setCustomers] = useState<CustomerSummary[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
   const [coupons, setCoupons] = useState<Coupon[]>([]);
   const [slides, setSlides] = useState<CarouselSlide[]>([]);
@@ -91,17 +104,39 @@ export function AdminPanel({
     password: '',
   });
   const [savingCourier, setSavingCourier] = useState(false);
+  const [editingCourier, setEditingCourier] = useState<{
+    id: number;
+    name: string;
+    email: string;
+    whatsapp: string;
+    password: string;
+    active: boolean;
+  } | null>(null);
+  const [savingEditCourier, setSavingEditCourier] = useState(false);
+  const [confirmDeleteCourierId, setConfirmDeleteCourierId] = useState<number | null>(null);
+  const [deletingCourierId, setDeletingCourierId] = useState<number | null>(null);
 
   const [editingProduct, setEditingProduct] = useState<{
     id?: number;
+    sku: string;
     name: string;
     category: string;
     description: string;
     price: string;
+    costPrice: string;
+    freightCostUnit: string;
+    packagingCostUnit: string;
+    otherCostUnit: string;
+    purchasedQuantity: string;
+    stockQuantity: string;
     imageUrl: string;
+    variationLabel: string;
     variationsText: string;
+    secondaryVariationLabel: string;
+    secondaryVariationsText: string;
     active: boolean;
   } | null>(null);
+  const [confirmDeleteProductId, setConfirmDeleteProductId] = useState<number | null>(null);
   const [uploadingProductImage, setUploadingProductImage] = useState(false);
   const productFileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -111,8 +146,12 @@ export function AdminPanel({
     discountType: 'percent' | 'fixed' | 'free_shipping';
     discountValue: string;
     minOrderValue: string;
+    audience: 'all' | 'specific';
+    allowedEmail: string;
+    allowMultipleUses: boolean;
     active: boolean;
   } | null>(null);
+  const [confirmDeleteCouponId, setConfirmDeleteCouponId] = useState<number | null>(null);
 
   const [editingSlide, setEditingSlide] = useState<{
     id?: number;
@@ -125,6 +164,7 @@ export function AdminPanel({
     sortOrder: string;
     active: boolean;
   } | null>(null);
+  const [confirmDeleteSlideId, setConfirmDeleteSlideId] = useState<number | null>(null);
   const [uploadingSlideImage, setUploadingSlideImage] = useState(false);
   const slideFileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -148,6 +188,7 @@ export function AdminPanel({
       ]);
       setOrders(data.orders);
       setCouriers(data.couriers || []);
+      setCustomers(data.customers || []);
       setProducts(data.products);
       setCoupons(data.coupons);
       setSlides(data.slides);
@@ -258,11 +299,54 @@ export function AdminPanel({
       setCouriers((prev) => prev.map((c) => (c.id === courier.id ? res.courier : c)));
       showNotice(
         res.courier.active
-          ? `Motoboy ${res.courier.name} reativado.`
-          : `Motoboy ${res.courier.name} desativado.`
+          ? `Entregador ${res.courier.name} reativado.`
+          : `Entregador ${res.courier.name} desativado.`
       );
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Erro ao atualizar motoboy.');
+      setError(err instanceof Error ? err.message : 'Erro ao atualizar entregador.');
+    }
+  }
+
+  async function handleUpdateCourier(e: FormEvent) {
+    e.preventDefault();
+    if (!editingCourier) return;
+    setError('');
+    setSavingEditCourier(true);
+    try {
+      const res = await api.updateAdminCourier(token, editingCourier.id, {
+        name: editingCourier.name.trim(),
+        email: editingCourier.email.trim(),
+        whatsapp: editingCourier.whatsapp.trim(),
+        active: editingCourier.active,
+        password: editingCourier.password.trim() || undefined,
+      });
+      setCouriers((prev) => prev.map((c) => (c.id === res.courier.id ? res.courier : c)));
+      setEditingCourier(null);
+      await loadOverview(true);
+      showNotice(`Entregador ${res.courier.name} salvo no banco de dados.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Erro ao atualizar entregador.');
+    } finally {
+      setSavingEditCourier(false);
+    }
+  }
+
+  async function handleDeleteCourier(courier: CourierSummary) {
+    setError('');
+    setDeletingCourierId(courier.id);
+    try {
+      await api.deleteAdminCourier(token, courier.id);
+      setCouriers((prev) => prev.filter((c) => c.id !== courier.id));
+      setConfirmDeleteCourierId(null);
+      if (editingCourier?.id === courier.id) {
+        setEditingCourier(null);
+      }
+      await loadOverview(true);
+      showNotice(`Entregador ${courier.name} excluído permanentemente.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Erro ao excluir entregador.');
+    } finally {
+      setDeletingCourierId(null);
     }
   }
 
@@ -290,24 +374,56 @@ export function AdminPanel({
     setError('');
     try {
       const price = Number(editingProduct.price.replace(',', '.'));
+      const costPrice = Math.max(0, Number((editingProduct.costPrice || '0').replace(',', '.')) || 0);
+      const freightCostUnit = Math.max(
+        0,
+        Number((editingProduct.freightCostUnit || '0').replace(',', '.')) || 0
+      );
+      const packagingCostUnit = Math.max(
+        0,
+        Number((editingProduct.packagingCostUnit || '0').replace(',', '.')) || 0
+      );
+      const otherCostUnit = Math.max(
+        0,
+        Number((editingProduct.otherCostUnit || '0').replace(',', '.')) || 0
+      );
+      const purchasedQuantity = Math.max(
+        0,
+        Math.round(Number(editingProduct.purchasedQuantity || '0') || 0)
+      );
+      const stockQuantity = Math.max(0, Math.round(Number(editingProduct.stockQuantity || '0') || 0));
       const variations = editingProduct.variationsText
+        .split(',')
+        .map((v) => v.trim())
+        .filter(Boolean);
+      const secondaryVariations = editingProduct.secondaryVariationsText
         .split(',')
         .map((v) => v.trim())
         .filter(Boolean);
       await api.saveProduct(token, {
         id: editingProduct.id,
+        sku: editingProduct.sku.trim().toUpperCase(),
         name: editingProduct.name,
         category: editingProduct.category,
         description: editingProduct.description,
         price,
+        costPrice,
+        freightCostUnit,
+        packagingCostUnit,
+        otherCostUnit,
+        purchasedQuantity,
+        stockQuantity,
         imageUrl: editingProduct.imageUrl,
+        variationLabel: editingProduct.variationLabel.trim() || 'Sabor / Variação',
         variations,
+        secondaryVariationLabel: editingProduct.secondaryVariationLabel.trim(),
+        secondaryVariations,
         active: editingProduct.active,
       });
       setEditingProduct(null);
       await loadOverview();
       onStoreDataChanged();
-      showNotice('Produto salvo com sucesso.');
+      showNotice('Produto salvo no banco! Ele só sai quando você clicar em Excluir.');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Erro ao salvar produto.');
     }
@@ -316,9 +432,10 @@ export function AdminPanel({
   async function handleDeleteProduct(id: number) {
     try {
       await api.deleteProduct(token, id);
+      setConfirmDeleteProductId(null);
       await loadOverview();
       onStoreDataChanged();
-      showNotice('Produto removido.');
+      showNotice('Produto excluído permanentemente.');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Erro ao remover produto.');
     }
@@ -328,6 +445,12 @@ export function AdminPanel({
     e.preventDefault();
     if (!editingCoupon) return;
     setError('');
+    const normalizedAllowedEmail =
+      editingCoupon.audience === 'specific' ? editingCoupon.allowedEmail.trim().toLowerCase() : null;
+    if (editingCoupon.audience === 'specific' && !normalizedAllowedEmail) {
+      setError('Informe o e-mail do usuário autorizado a usar este cupom.');
+      return;
+    }
     try {
       await api.saveCoupon(token, {
         id: editingCoupon.id,
@@ -335,11 +458,13 @@ export function AdminPanel({
         discountType: editingCoupon.discountType,
         discountValue: Number(editingCoupon.discountValue.replace(',', '.')),
         minOrderValue: Number((editingCoupon.minOrderValue || '0').replace(',', '.')),
+        allowedEmail: normalizedAllowedEmail,
+        allowMultipleUses: editingCoupon.allowMultipleUses,
         active: editingCoupon.active,
       });
       setEditingCoupon(null);
       await loadOverview();
-      showNotice('Cupom salvo com sucesso.');
+      showNotice('Cupom salvo com sucesso. Permanece salvo até você excluir.');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Erro ao salvar cupom.');
     }
@@ -348,8 +473,9 @@ export function AdminPanel({
   async function handleDeleteCoupon(id: number) {
     try {
       await api.deleteCoupon(token, id);
+      setConfirmDeleteCouponId(null);
       await loadOverview();
-      showNotice('Cupom removido.');
+      showNotice('Cupom excluído permanentemente.');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Erro ao remover cupom.');
     }
@@ -401,9 +527,10 @@ export function AdminPanel({
   async function handleDeleteSlide(id: number) {
     try {
       await api.deleteSlide(token, id);
+      setConfirmDeleteSlideId(null);
       await loadOverview();
       onStoreDataChanged();
-      showNotice('Slide removido.');
+      showNotice('Slide excluído permanentemente.');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Erro ao remover slide.');
     }
@@ -520,6 +647,7 @@ export function AdminPanel({
           { id: 'orders', label: `Pedidos (${orders.length})`, icon: ClipboardList },
           { id: 'couriers', label: `Motoboys (${couriers.length})`, icon: Bike },
           { id: 'products', label: `Produtos (${products.length})`, icon: Package },
+          { id: 'profit', label: 'Rentabilidade', icon: TrendingUp },
           { id: 'coupons', label: `Cupons (${coupons.length})`, icon: Tag },
           { id: 'carousel', label: `Carrossel (${slides.length})`, icon: Layers },
           { id: 'roulette', label: 'Roleta', icon: Gift },
@@ -842,16 +970,111 @@ export function AdminPanel({
                 </button>
               </form>
 
+              {editingCourier && (
+                <form
+                  onSubmit={handleUpdateCourier}
+                  className="rounded-3xl border border-white/25 bg-[#111111] p-5 sm:p-6 space-y-4"
+                >
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-base font-extrabold text-white">
+                      Editar Entregador — {editingCourier.name}
+                    </h3>
+                    <button
+                      type="button"
+                      onClick={() => setEditingCourier(null)}
+                      className="p-1.5 rounded-lg text-[#9E9E9E] hover:text-white"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
+                    <div>
+                      <label className="block text-xs font-semibold text-[#E5E5E5] mb-1">Nome completo *</label>
+                      <input
+                        type="text"
+                        required
+                        value={editingCourier.name}
+                        onChange={(e) => setEditingCourier({ ...editingCourier, name: e.target.value })}
+                        className="w-full h-11 px-3.5 rounded-xl bg-black border border-white/15 text-sm text-white focus:outline-none focus:border-white"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-[#E5E5E5] mb-1">E-mail de acesso *</label>
+                      <input
+                        type="email"
+                        required
+                        value={editingCourier.email}
+                        onChange={(e) => setEditingCourier({ ...editingCourier, email: e.target.value })}
+                        className="w-full h-11 px-3.5 rounded-xl bg-black border border-white/15 text-sm text-white focus:outline-none focus:border-white"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-[#E5E5E5] mb-1">WhatsApp</label>
+                      <input
+                        type="tel"
+                        value={editingCourier.whatsapp}
+                        onChange={(e) =>
+                          setEditingCourier({ ...editingCourier, whatsapp: formatWhatsappInput(e.target.value) })
+                        }
+                        className="w-full h-11 px-3.5 rounded-xl bg-black border border-white/15 text-sm text-white tabular-nums focus:outline-none focus:border-white"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-[#E5E5E5] mb-1">
+                        Nova senha (opcional)
+                      </label>
+                      <input
+                        type="password"
+                        minLength={6}
+                        value={editingCourier.password}
+                        onChange={(e) => setEditingCourier({ ...editingCourier, password: e.target.value })}
+                        placeholder="Manter senha atual"
+                        className="w-full h-11 px-3.5 rounded-xl bg-black border border-white/15 text-sm text-white focus:outline-none focus:border-white"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+                    <label className="inline-flex items-center gap-2 text-sm text-white cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={editingCourier.active}
+                        onChange={(e) => setEditingCourier({ ...editingCourier, active: e.target.checked })}
+                        className="w-4 h-4 accent-white"
+                      />
+                      Entregador ativo para entregas
+                    </label>
+                    <div className="flex items-center gap-2.5">
+                      <button
+                        type="button"
+                        onClick={() => setEditingCourier(null)}
+                        className="h-10 px-4 rounded-xl border border-white/15 text-xs sm:text-sm font-semibold text-[#9E9E9E] hover:text-white"
+                      >
+                        Cancelar
+                      </button>
+                      <button
+                        type="submit"
+                        disabled={savingEditCourier}
+                        className="h-10 px-5 rounded-xl bg-white text-black text-xs sm:text-sm font-extrabold hover:bg-neutral-200 disabled:opacity-50"
+                      >
+                        {savingEditCourier ? 'Salvando...' : 'Salvar Entregador'}
+                      </button>
+                    </div>
+                  </div>
+                </form>
+              )}
+
               {couriers.length === 0 ? (
                 <div className="rounded-3xl border border-white/12 bg-[#0C0C0C] p-10 text-center text-sm text-[#9E9E9E]">
-                  Nenhum motoboy cadastrado ainda.
+                  Nenhum motoboy cadastrado. Cadastre acima e ele ficará salvo até você excluir.
                 </div>
               ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   {couriers.map((courier) => (
                     <div
                       key={courier.id}
-                      className="rounded-2xl border border-white/12 bg-[#0C0C0C] p-4 sm:p-5 flex items-center justify-between gap-4"
+                      className="rounded-2xl border border-white/12 bg-[#0C0C0C] p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4"
                     >
                       <div className="min-w-0">
                         <div className="flex items-center gap-2">
@@ -872,13 +1095,60 @@ export function AdminPanel({
                         )}
                       </div>
 
-                      <button
-                        type="button"
-                        onClick={() => void handleToggleCourierActive(courier)}
-                        className="h-9 px-3.5 rounded-xl border border-white/15 text-xs font-bold text-white hover:bg-white hover:text-black transition-colors shrink-0"
-                      >
-                        {courier.active ? 'Desativar' : 'Reativar'}
-                      </button>
+                      {confirmDeleteCourierId === courier.id ? (
+                        <div className="flex items-center gap-2 shrink-0">
+                          <button
+                            type="button"
+                            disabled={deletingCourierId === courier.id}
+                            onClick={() => void handleDeleteCourier(courier)}
+                            className="h-9 px-3 rounded-xl bg-red-600 text-white text-xs font-bold hover:bg-red-500 disabled:opacity-50"
+                          >
+                            {deletingCourierId === courier.id ? 'Excluindo...' : 'Confirmar'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmDeleteCourierId(null)}
+                            className="h-9 px-3 rounded-xl border border-white/15 text-xs text-[#9E9E9E] hover:text-white"
+                          >
+                            Cancelar
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="flex items-center gap-2 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => void handleToggleCourierActive(courier)}
+                            className="h-9 px-3 rounded-xl border border-white/15 text-xs font-bold text-white hover:bg-white hover:text-black transition-colors"
+                          >
+                            {courier.active ? 'Desativar' : 'Reativar'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setEditingCourier({
+                                id: courier.id,
+                                name: courier.name,
+                                email: courier.email,
+                                whatsapp: courier.whatsapp || '',
+                                password: '',
+                                active: courier.active,
+                              })
+                            }
+                            aria-label={`Editar entregador ${courier.name}`}
+                            className="w-9 h-9 flex items-center justify-center rounded-xl border border-white/15 text-white hover:bg-white hover:text-black transition-colors"
+                          >
+                            <Edit3 className="w-4 h-4" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmDeleteCourierId(courier.id)}
+                            aria-label={`Excluir entregador ${courier.name}`}
+                            className="w-9 h-9 flex items-center justify-center rounded-xl border border-white/15 text-[#9E9E9E] hover:text-red-400 hover:border-red-500/40 transition-colors"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -889,22 +1159,37 @@ export function AdminPanel({
           {/* PRODUCTS TAB */}
           {tab === 'products' && (
             <div className="space-y-5">
-              <div className="flex justify-between items-center">
-                <h2 className="text-lg font-bold text-white">Produtos Cadastrados</h2>
+              <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3">
+                <div>
+                  <h2 className="text-lg font-bold text-white">Produtos Cadastrados</h2>
+                  <p className="text-xs text-[#9E9E9E]">
+                    Tudo que você salvar aqui fica gravado no banco e só sai quando você clicar em Excluir.
+                  </p>
+                </div>
                 <button
                   type="button"
                   onClick={() =>
                     setEditingProduct({
+                      sku: '',
                       name: '',
                       category: 'Essências',
                       description: '',
                       price: '',
+                      costPrice: '0',
+                      freightCostUnit: '0',
+                      packagingCostUnit: '0',
+                      otherCostUnit: '0',
+                      purchasedQuantity: '0',
+                      stockQuantity: '0',
                       imageUrl: PRESET_IMAGES[1].url,
+                      variationLabel: 'Sabor / Variação',
                       variationsText: '',
+                      secondaryVariationLabel: '',
+                      secondaryVariationsText: '',
                       active: true,
                     })
                   }
-                  className="inline-flex items-center gap-2 h-10 px-4 rounded-xl bg-white text-black font-bold text-xs sm:text-sm hover:bg-neutral-200 transition-colors"
+                  className="inline-flex items-center gap-2 h-10 px-4 rounded-xl bg-white text-black font-bold text-xs sm:text-sm hover:bg-neutral-200 transition-colors self-start sm:self-auto shrink-0"
                 >
                   <Plus className="w-4 h-4" />
                   Adicionar Produto
@@ -941,7 +1226,32 @@ export function AdminPanel({
                       />
                     </div>
                     <div>
-                      <label className="block text-xs font-semibold text-[#E5E5E5] mb-1">Preço (R$) *</label>
+                      <label className="block text-xs font-semibold text-[#E5E5E5] mb-1">SKU (opcional)</label>
+                      <input
+                        type="text"
+                        value={editingProduct.sku}
+                        onChange={(e) => setEditingProduct({ ...editingProduct, sku: e.target.value })}
+                        placeholder="Automático se vazio"
+                        className="w-full h-11 px-4 rounded-xl bg-black border border-white/15 text-sm text-white uppercase focus:outline-none focus:border-white"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-[#E5E5E5] mb-1">
+                        Valor de compra / un. (R$)
+                      </label>
+                      <input
+                        type="number"
+                        step="0.01"
+                        min="0"
+                        value={editingProduct.costPrice}
+                        onChange={(e) => setEditingProduct({ ...editingProduct, costPrice: e.target.value })}
+                        className="w-full h-11 px-4 rounded-xl bg-black border border-white/15 text-sm text-white focus:outline-none focus:border-white tabular-nums"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-[#E5E5E5] mb-1">
+                        Preço de venda / un. (R$) *
+                      </label>
                       <input
                         type="number"
                         step="0.01"
@@ -963,9 +1273,98 @@ export function AdminPanel({
                         className="w-full h-11 px-4 rounded-xl bg-black border border-white/15 text-sm text-white focus:outline-none focus:border-white"
                       />
                     </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-[#E5E5E5] mb-1">
+                        Quantidade comprada (un.)
+                      </label>
+                      <input
+                        type="number"
+                        step="1"
+                        min="0"
+                        value={editingProduct.purchasedQuantity}
+                        onChange={(e) =>
+                          setEditingProduct({ ...editingProduct, purchasedQuantity: e.target.value })
+                        }
+                        className="w-full h-11 px-4 rounded-xl bg-black border border-white/15 text-sm text-white focus:outline-none focus:border-white tabular-nums"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-[#E5E5E5] mb-1">
+                        Estoque disponível (un.)
+                      </label>
+                      <input
+                        type="number"
+                        step="1"
+                        min="0"
+                        value={editingProduct.stockQuantity}
+                        onChange={(e) =>
+                          setEditingProduct({ ...editingProduct, stockQuantity: e.target.value })
+                        }
+                        className="w-full h-11 px-4 rounded-xl bg-black border border-white/15 text-sm text-white focus:outline-none focus:border-white tabular-nums"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-[#E5E5E5] mb-1">
+                        Frete de compra / un. (R$)
+                      </label>
+                      <input
+                        type="number"
+                        step="0.01"
+                        min="0"
+                        value={editingProduct.freightCostUnit}
+                        onChange={(e) =>
+                          setEditingProduct({ ...editingProduct, freightCostUnit: e.target.value })
+                        }
+                        className="w-full h-11 px-4 rounded-xl bg-black border border-white/15 text-sm text-white focus:outline-none focus:border-white tabular-nums"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-[#E5E5E5] mb-1">
+                        Embalagem / un. (R$)
+                      </label>
+                      <input
+                        type="number"
+                        step="0.01"
+                        min="0"
+                        value={editingProduct.packagingCostUnit}
+                        onChange={(e) =>
+                          setEditingProduct({ ...editingProduct, packagingCostUnit: e.target.value })
+                        }
+                        className="w-full h-11 px-4 rounded-xl bg-black border border-white/15 text-sm text-white focus:outline-none focus:border-white tabular-nums"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-[#E5E5E5] mb-1">
+                        Outros custos / un. (R$)
+                      </label>
+                      <input
+                        type="number"
+                        step="0.01"
+                        min="0"
+                        value={editingProduct.otherCostUnit}
+                        onChange={(e) =>
+                          setEditingProduct({ ...editingProduct, otherCostUnit: e.target.value })
+                        }
+                        className="w-full h-11 px-4 rounded-xl bg-black border border-white/15 text-sm text-white focus:outline-none focus:border-white tabular-nums"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-[#E5E5E5] mb-1">
+                        Título da 1ª seleção
+                      </label>
+                      <input
+                        type="text"
+                        value={editingProduct.variationLabel}
+                        onChange={(e) =>
+                          setEditingProduct({ ...editingProduct, variationLabel: e.target.value })
+                        }
+                        placeholder="Ex: Sabor"
+                        className="w-full h-11 px-4 rounded-xl bg-black border border-white/15 text-sm text-white focus:outline-none focus:border-white"
+                      />
+                    </div>
                     <div className="sm:col-span-2">
                       <label className="block text-xs font-semibold text-[#E5E5E5] mb-1">
-                        Sabores / Variações (separados por vírgula)
+                        1ª Variação / Sabores (por vírgula)
                       </label>
                       <input
                         type="text"
@@ -973,7 +1372,35 @@ export function AdminPanel({
                         onChange={(e) =>
                           setEditingProduct({ ...editingProduct, variationsText: e.target.value })
                         }
-                        placeholder="Ex: Menta, Melancia, Love 66"
+                        placeholder="Ex: Melancia, Tropical"
+                        className="w-full h-11 px-4 rounded-xl bg-black border border-white/15 text-sm text-white focus:outline-none focus:border-white"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-[#E5E5E5] mb-1">
+                        Título da 2ª seleção (opcional)
+                      </label>
+                      <input
+                        type="text"
+                        value={editingProduct.secondaryVariationLabel}
+                        onChange={(e) =>
+                          setEditingProduct({ ...editingProduct, secondaryVariationLabel: e.target.value })
+                        }
+                        placeholder="Ex: Gelo"
+                        className="w-full h-11 px-4 rounded-xl bg-black border border-white/15 text-sm text-white focus:outline-none focus:border-white"
+                      />
+                    </div>
+                    <div className="sm:col-span-2">
+                      <label className="block text-xs font-semibold text-[#E5E5E5] mb-1">
+                        2ª Variação / Sabores (por vírgula — opcional)
+                      </label>
+                      <input
+                        type="text"
+                        value={editingProduct.secondaryVariationsText}
+                        onChange={(e) =>
+                          setEditingProduct({ ...editingProduct, secondaryVariationsText: e.target.value })
+                        }
+                        placeholder="Ex: Gelo de coco, Gelo de melancia, Gelo de maracujá"
                         className="w-full h-11 px-4 rounded-xl bg-black border border-white/15 text-sm text-white focus:outline-none focus:border-white"
                       />
                     </div>
@@ -1060,6 +1487,57 @@ export function AdminPanel({
                     </div>
                   </div>
 
+                  {(() => {
+                    const liveCalc = computeProductProfitMetrics({
+                      price: Number((editingProduct.price || '0').replace(',', '.')) || 0,
+                      costPrice: Number((editingProduct.costPrice || '0').replace(',', '.')) || 0,
+                      freightCostUnit:
+                        Number((editingProduct.freightCostUnit || '0').replace(',', '.')) || 0,
+                      packagingCostUnit:
+                        Number((editingProduct.packagingCostUnit || '0').replace(',', '.')) || 0,
+                      otherCostUnit: Number((editingProduct.otherCostUnit || '0').replace(',', '.')) || 0,
+                      purchasedQuantity: Math.max(0, Math.round(Number(editingProduct.purchasedQuantity || '0') || 0)),
+                      stockQuantity: Math.max(0, Math.round(Number(editingProduct.stockQuantity || '0') || 0)),
+                    });
+                    return (
+                      <div className="p-3.5 rounded-2xl border border-white/12 bg-black grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+                        <div>
+                          <p className="text-[#9E9E9E]">Custo total / un.</p>
+                          <p className="text-sm font-bold text-white tabular-nums mt-0.5">
+                            {formatBRL(liveCalc.totalUnitCost)}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-[#9E9E9E]">Lucro bruto / un.</p>
+                          <p
+                            className={`text-sm font-extrabold tabular-nums mt-0.5 ${
+                              liveCalc.profitPerUnit >= 0 ? 'text-emerald-400' : 'text-red-400'
+                            }`}
+                          >
+                            {formatBRL(liveCalc.profitPerUnit)}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-[#9E9E9E]">Margem · Markup</p>
+                          <p className="text-sm font-bold text-white tabular-nums mt-0.5">
+                            {liveCalc.marginPercent.toFixed(1).replace('.', ',')}% ·{' '}
+                            {liveCalc.markupPercent.toFixed(1).replace('.', ',')}%
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-[#9E9E9E]">Lucro potencial estoque</p>
+                          <p
+                            className={`text-sm font-extrabold tabular-nums mt-0.5 ${
+                              liveCalc.potentialProfit >= 0 ? 'text-emerald-400' : 'text-red-400'
+                            }`}
+                          >
+                            {formatBRL(liveCalc.potentialProfit)}
+                          </p>
+                        </div>
+                      </div>
+                    );
+                  })()}
+
                   <label className="inline-flex items-center gap-2 text-sm text-white cursor-pointer">
                     <input
                       type="checkbox"
@@ -1090,61 +1568,133 @@ export function AdminPanel({
               )}
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {products.map((p) => (
-                  <div
-                    key={p.id}
-                    className="flex items-center gap-4 p-4 rounded-2xl border border-white/12 bg-[#0C0C0C]"
-                  >
-                    <div className="w-20 h-20 rounded-xl overflow-hidden bg-[#141414] shrink-0">
-                      <SafeProductImage src={p.imageUrl} alt={p.name} className="w-full h-full object-cover" />
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-xs text-[#9E9E9E]">
-                        {p.category} · {p.active ? 'Ativo' : 'Oculto'}
-                      </p>
-                      <h3 className="text-sm font-bold text-white truncate">{p.name}</h3>
-                      <p className="text-sm font-extrabold text-white tabular-nums mt-0.5">
-                        {formatBRL(p.price)}
-                      </p>
-                      {p.variations.length > 0 && (
-                        <p className="text-xs text-[#9E9E9E] truncate mt-0.5">
-                          Variações: {p.variations.join(', ')}
+                {products.map((p) => {
+                  const cardMetrics = computeProductProfitMetrics({
+                    price: p.price,
+                    costPrice: Number(p.costPrice || 0),
+                    freightCostUnit: Number(p.freightCostUnit || 0),
+                    packagingCostUnit: Number(p.packagingCostUnit || 0),
+                    otherCostUnit: Number(p.otherCostUnit || 0),
+                    purchasedQuantity: Number(p.purchasedQuantity || 0),
+                    stockQuantity: Number(p.stockQuantity || 0),
+                  });
+                  return (
+                    <div
+                      key={p.id}
+                      className="flex items-center gap-4 p-4 rounded-2xl border border-white/12 bg-[#0C0C0C]"
+                    >
+                      <div className="w-20 h-20 rounded-xl overflow-hidden bg-[#141414] shrink-0">
+                        <SafeProductImage src={p.imageUrl} alt={p.name} className="w-full h-full object-cover" />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-xs text-[#9E9E9E] truncate">
+                          {p.sku || `RP-${String(p.id).padStart(4, '0')}`} · {p.category} ·{' '}
+                          {p.active ? 'Ativo' : 'Oculto'}
                         </p>
+                        <h3 className="text-sm font-bold text-white truncate">{p.name}</h3>
+                        <p className="text-sm font-extrabold text-white tabular-nums mt-0.5">
+                          {formatBRL(p.price)}
+                          {cardMetrics.totalUnitCost > 0 && (
+                            <span className="text-[11px] font-semibold text-[#9E9E9E] ml-2">
+                              · Custo {formatBRL(cardMetrics.totalUnitCost)} · Lucro{' '}
+                              <span
+                                className={
+                                  cardMetrics.profitPerUnit >= 0 ? 'text-emerald-400' : 'text-red-400'
+                                }
+                              >
+                                {formatBRL(cardMetrics.profitPerUnit)}
+                              </span>
+                            </span>
+                          )}
+                        </p>
+                        <p className="text-xs text-[#9E9E9E] truncate mt-0.5 tabular-nums">
+                          Estoque: {p.stockQuantity ?? 0} un.
+                          {p.variations.length > 0 ? ` · ${p.variations.join(', ')}` : ''}
+                          {p.secondaryVariations && p.secondaryVariations.length > 0
+                            ? ` · ${p.secondaryVariationLabel || '2ª'}: ${p.secondaryVariations.join(', ')}`
+                            : ''}
+                        </p>
+                      </div>
+                      {confirmDeleteProductId === p.id ? (
+                        <div className="flex flex-col gap-1.5 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => void handleDeleteProduct(p.id)}
+                            className="h-8 px-2.5 rounded-lg bg-red-600 text-white text-[11px] font-bold hover:bg-red-500"
+                          >
+                            Confirmar
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmDeleteProductId(null)}
+                            className="h-8 px-2.5 rounded-lg border border-white/15 text-[11px] text-[#9E9E9E] hover:text-white"
+                          >
+                            Cancelar
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="flex flex-col gap-2 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setEditingProduct({
+                                id: p.id,
+                                sku: p.sku || `RP-${String(p.id).padStart(4, '0')}`,
+                                name: p.name,
+                                category: p.category,
+                                description: p.description,
+                                price: String(p.price),
+                                costPrice: String(p.costPrice ?? 0),
+                                freightCostUnit: String(p.freightCostUnit ?? 0),
+                                packagingCostUnit: String(p.packagingCostUnit ?? 0),
+                                otherCostUnit: String(p.otherCostUnit ?? 0),
+                                purchasedQuantity: String(p.purchasedQuantity ?? 0),
+                                stockQuantity: String(p.stockQuantity ?? 0),
+                                imageUrl: p.imageUrl,
+                                variationLabel: p.variationLabel || 'Sabor / Variação',
+                                variationsText: p.variations.join(', '),
+                                secondaryVariationLabel: p.secondaryVariationLabel || '',
+                                secondaryVariationsText: (p.secondaryVariations || []).join(', '),
+                                active: p.active,
+                              })
+                            }
+                            aria-label={`Editar ${p.name}`}
+                            className="w-9 h-9 flex items-center justify-center rounded-xl border border-white/15 text-white hover:bg-white hover:text-black transition-colors"
+                          >
+                            <Edit3 className="w-4 h-4" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmDeleteProductId(p.id)}
+                            aria-label={`Excluir ${p.name}`}
+                            className="w-9 h-9 flex items-center justify-center rounded-xl border border-white/15 text-[#9E9E9E] hover:text-red-400 hover:border-red-500/40 transition-colors"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
                       )}
-                    </div>
-                    <div className="flex flex-col gap-2 shrink-0">
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setEditingProduct({
-                            id: p.id,
-                            name: p.name,
-                            category: p.category,
-                            description: p.description,
-                            price: String(p.price),
-                            imageUrl: p.imageUrl,
-                            variationsText: p.variations.join(', '),
-                            active: p.active,
-                          })
-                        }
-                        aria-label={`Editar ${p.name}`}
-                        className="w-9 h-9 flex items-center justify-center rounded-xl border border-white/15 text-white hover:bg-white hover:text-black transition-colors"
-                      >
-                        <Edit3 className="w-4 h-4" />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => void handleDeleteProduct(p.id)}
-                        aria-label={`Excluir ${p.name}`}
-                        className="w-9 h-9 flex items-center justify-center rounded-xl border border-white/15 text-[#9E9E9E] hover:text-red-400 hover:border-red-500/40 transition-colors"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    </div>
                   </div>
-                ))}
+                  );
+                })}
               </div>
+              {products.length === 0 && (
+                <div className="rounded-3xl border border-white/12 bg-[#0C0C0C] p-10 text-center text-sm text-[#9E9E9E]">
+                  Nenhum produto cadastrado no momento. Clique em &ldquo;Adicionar Produto&rdquo; para cadastrar e salvar.
+                </div>
+              )}
             </div>
+          )}
+
+          {/* R&P PROFIT MANAGER TAB (RENTABILIDADE) */}
+          {tab === 'profit' && (
+            <ProfitManagerModule
+              token={token}
+              liveSyncTrigger={liveSyncTrigger}
+              onProductsChanged={() => {
+                void loadOverview(true);
+                onStoreDataChanged();
+              }}
+            />
           )}
 
           {/* COUPONS TAB */}
@@ -1160,6 +1710,9 @@ export function AdminPanel({
                       discountType: 'percent',
                       discountValue: '10',
                       minOrderValue: '0',
+                      audience: 'all',
+                      allowedEmail: '',
+                      allowMultipleUses: true,
                       active: true,
                     })
                   }
@@ -1259,6 +1812,107 @@ export function AdminPanel({
                     </div>
                   </div>
 
+                  {/* Who can use & Reuse rules */}
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2 border-t border-white/10">
+                    <div className="space-y-2.5">
+                      <label className="block text-xs font-semibold text-[#E5E5E5]">
+                        Quem pode usar este cupom?
+                      </label>
+                      <div className="grid grid-cols-2 gap-2">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setEditingCoupon({ ...editingCoupon, audience: 'all', allowedEmail: '' })
+                          }
+                          className={`h-10 px-3 rounded-xl border text-xs font-bold transition-colors ${
+                            editingCoupon.audience === 'all'
+                              ? 'bg-white text-black border-white'
+                              : 'bg-black text-[#9E9E9E] border-white/15 hover:text-white'
+                          }`}
+                        >
+                          Todos os usuários
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setEditingCoupon({ ...editingCoupon, audience: 'specific' })}
+                          className={`h-10 px-3 rounded-xl border text-xs font-bold transition-colors ${
+                            editingCoupon.audience === 'specific'
+                              ? 'bg-white text-black border-white'
+                              : 'bg-black text-[#9E9E9E] border-white/15 hover:text-white'
+                          }`}
+                        >
+                          Usuário específico
+                        </button>
+                      </div>
+
+                      {editingCoupon.audience === 'specific' && (
+                        <div>
+                          <label htmlFor="coupon-allowed-email" className="block text-[11px] text-[#9E9E9E] mb-1">
+                            E-mail do usuário autorizado *
+                          </label>
+                          <input
+                            id="coupon-allowed-email"
+                            type="email"
+                            required
+                            list="coupon-customer-emails"
+                            value={editingCoupon.allowedEmail}
+                            onChange={(e) =>
+                              setEditingCoupon({ ...editingCoupon, allowedEmail: e.target.value })
+                            }
+                            placeholder="Ex: ryansouzapereira44@gmail.com"
+                            className="w-full h-11 px-4 rounded-xl bg-black border border-white/15 text-sm text-white focus:outline-none focus:border-white"
+                          />
+                          <datalist id="coupon-customer-emails">
+                            {customers.map((customer) => (
+                              <option key={customer.id} value={customer.email}>
+                                {customer.name}
+                              </option>
+                            ))}
+                          </datalist>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="space-y-2.5">
+                      <label className="block text-xs font-semibold text-[#E5E5E5]">
+                        Pode usar mais de uma vez?
+                      </label>
+                      <div className="grid grid-cols-2 gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setEditingCoupon({ ...editingCoupon, allowMultipleUses: true })}
+                          className={`h-10 px-3 rounded-xl border text-xs font-bold transition-colors ${
+                            editingCoupon.allowMultipleUses
+                              ? 'bg-white text-black border-white'
+                              : 'bg-black text-[#9E9E9E] border-white/15 hover:text-white'
+                          }`}
+                        >
+                          Sim (várias vezes)
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setEditingCoupon({ ...editingCoupon, allowMultipleUses: false })}
+                          className={`h-10 px-3 rounded-xl border text-xs font-bold transition-colors ${
+                            !editingCoupon.allowMultipleUses
+                              ? 'bg-white text-black border-white'
+                              : 'bg-black text-[#9E9E9E] border-white/15 hover:text-white'
+                          }`}
+                        >
+                          Não (apenas 1 vez)
+                        </button>
+                      </div>
+                      <p className="text-[11px] text-[#9E9E9E]">
+                        {editingCoupon.allowMultipleUses
+                          ? editingCoupon.audience === 'specific'
+                            ? 'O usuário escolhido poderá aplicar este cupom em vários pedidos.'
+                            : 'Todos os clientes poderão reutilizar este cupom em múltiplos pedidos.'
+                          : editingCoupon.audience === 'specific'
+                            ? 'Somente este e-mail poderá usar o cupom, e apenas 1 vez.'
+                            : 'Cada cliente cadastrado poderá usar este cupom apenas 1 vez.'}
+                      </p>
+                    </div>
+                  </div>
+
                   <label className="inline-flex items-center gap-2 text-sm text-white cursor-pointer">
                     <input
                       type="checkbox"
@@ -1293,8 +1947,8 @@ export function AdminPanel({
                     key={c.id}
                     className="flex items-center justify-between gap-4 p-4 rounded-2xl border border-white/12 bg-[#0C0C0C]"
                   >
-                    <div>
-                      <div className="flex items-center gap-2">
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
                         <span className="text-base font-extrabold text-white">{c.code}</span>
                         <span className="text-xs text-[#9E9E9E]">
                           · {c.active ? 'Ativo' : 'Inativo'}
@@ -1309,43 +1963,82 @@ export function AdminPanel({
                             : `${formatBRL(c.discountValue)} de desconto`}
                         {c.minOrderValue > 0 ? ` · Mínimo ${formatBRL(c.minOrderValue)}` : ''}
                       </p>
-                      <p className="text-xs text-[#9E9E9E] mt-0.5 tabular-nums">
+                      <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
+                        <span className="px-2 py-0.5 rounded-md bg-white/10 text-[11px] font-semibold text-white">
+                          {c.allowedEmail
+                            ? `Só: ${c.allowedEmail}`
+                            : c.ownerUserId
+                              ? `Cliente #${c.ownerUserId}`
+                              : 'Todos os usuários'}
+                        </span>
+                        <span className="px-2 py-0.5 rounded-md bg-white/10 text-[11px] font-semibold text-[#E5E5E5]">
+                          {c.allowMultipleUses ? 'Múltiplos usos' : 'Uso único (1x por usuário)'}
+                        </span>
+                      </div>
+                      <p className="text-xs text-[#9E9E9E] mt-1 tabular-nums">
                         Usos: {c.usageCount}
                         {c.maxUses !== null ? ` / ${c.maxUses}` : ''}
                         {c.expiresAt ? ` · Expira em ${formatDateTimeBR(c.expiresAt)}` : ''}
                       </p>
                     </div>
 
-                    <div className="flex items-center gap-2 shrink-0">
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setEditingCoupon({
-                            id: c.id,
-                            code: c.code,
-                            discountType: c.discountType,
-                            discountValue: String(c.discountValue),
-                            minOrderValue: String(c.minOrderValue),
-                            active: c.active,
-                          })
-                        }
-                        aria-label={`Editar cupom ${c.code}`}
-                        className="w-9 h-9 flex items-center justify-center rounded-xl border border-white/15 text-white hover:bg-white hover:text-black transition-colors"
-                      >
-                        <Edit3 className="w-4 h-4" />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => void handleDeleteCoupon(c.id)}
-                        aria-label={`Excluir cupom ${c.code}`}
-                        className="w-9 h-9 flex items-center justify-center rounded-xl border border-white/15 text-[#9E9E9E] hover:text-red-400 hover:border-red-500/40 transition-colors"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    </div>
+                    {confirmDeleteCouponId === c.id ? (
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => void handleDeleteCoupon(c.id)}
+                          className="h-9 px-3 rounded-xl bg-red-600 text-white text-xs font-bold hover:bg-red-500"
+                        >
+                          Confirmar
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setConfirmDeleteCouponId(null)}
+                          className="h-9 px-2.5 rounded-xl border border-white/15 text-xs text-[#9E9E9E] hover:text-white"
+                        >
+                          Cancelar
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="flex items-center gap-2 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setEditingCoupon({
+                              id: c.id,
+                              code: c.code,
+                              discountType: c.discountType,
+                              discountValue: String(c.discountValue),
+                              minOrderValue: String(c.minOrderValue),
+                              audience: c.allowedEmail ? 'specific' : 'all',
+                              allowedEmail: c.allowedEmail || '',
+                              allowMultipleUses: c.allowMultipleUses,
+                              active: c.active,
+                            })
+                          }
+                          aria-label={`Editar cupom ${c.code}`}
+                          className="w-9 h-9 flex items-center justify-center rounded-xl border border-white/15 text-white hover:bg-white hover:text-black transition-colors"
+                        >
+                          <Edit3 className="w-4 h-4" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setConfirmDeleteCouponId(c.id)}
+                          aria-label={`Excluir cupom ${c.code}`}
+                          className="w-9 h-9 flex items-center justify-center rounded-xl border border-white/15 text-[#9E9E9E] hover:text-red-400 hover:border-red-500/40 transition-colors"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>
+              {coupons.length === 0 && (
+                <div className="rounded-3xl border border-white/12 bg-[#0C0C0C] p-10 text-center text-sm text-[#9E9E9E]">
+                  Nenhum cupom cadastrado. Adicione um cupom para salvar permanentemente até excluir.
+                </div>
+              )}
             </div>
           )}
 
@@ -1565,38 +2258,62 @@ export function AdminPanel({
                       </div>
                     </div>
 
-                    <div className="flex items-center gap-2 shrink-0">
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setEditingSlide({
-                            id: s.id,
-                            tag: s.tag,
-                            title: s.title,
-                            subtitle: s.subtitle,
-                            ctaText: s.ctaText,
-                            targetCategory: s.targetCategory,
-                            imageUrl: s.imageUrl,
-                            sortOrder: String(s.sortOrder),
-                            active: s.active,
-                          })
-                        }
-                        aria-label={`Editar slide ${s.title}`}
-                        className="w-9 h-9 flex items-center justify-center rounded-xl border border-white/15 text-white hover:bg-white hover:text-black transition-colors"
-                      >
-                        <Edit3 className="w-4 h-4" />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => void handleDeleteSlide(s.id)}
-                        aria-label={`Excluir slide ${s.title}`}
-                        className="w-9 h-9 flex items-center justify-center rounded-xl border border-white/15 text-[#9E9E9E] hover:text-red-400 hover:border-red-500/40 transition-colors"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    </div>
+                    {confirmDeleteSlideId === s.id ? (
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => void handleDeleteSlide(s.id)}
+                          className="h-9 px-3 rounded-xl bg-red-600 text-white text-xs font-bold hover:bg-red-500"
+                        >
+                          Confirmar
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setConfirmDeleteSlideId(null)}
+                          className="h-9 px-2.5 rounded-xl border border-white/15 text-xs text-[#9E9E9E] hover:text-white"
+                        >
+                          Cancelar
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="flex items-center gap-2 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setEditingSlide({
+                              id: s.id,
+                              tag: s.tag,
+                              title: s.title,
+                              subtitle: s.subtitle,
+                              ctaText: s.ctaText,
+                              targetCategory: s.targetCategory,
+                              imageUrl: s.imageUrl,
+                              sortOrder: String(s.sortOrder),
+                              active: s.active,
+                            })
+                          }
+                          aria-label={`Editar slide ${s.title}`}
+                          className="w-9 h-9 flex items-center justify-center rounded-xl border border-white/15 text-white hover:bg-white hover:text-black transition-colors"
+                        >
+                          <Edit3 className="w-4 h-4" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setConfirmDeleteSlideId(s.id)}
+                          aria-label={`Excluir slide ${s.title}`}
+                          className="w-9 h-9 flex items-center justify-center rounded-xl border border-white/15 text-[#9E9E9E] hover:text-red-400 hover:border-red-500/40 transition-colors"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
+                    )}
                   </div>
                 ))}
+                {slides.length === 0 && (
+                  <div className="rounded-3xl border border-white/12 bg-[#0C0C0C] p-10 text-center text-sm text-[#9E9E9E]">
+                    Nenhum slide no carrossel. Clique em &ldquo;Novo Slide&rdquo; para adicionar e salvar.
+                  </div>
+                )}
               </div>
             </div>
           )}
