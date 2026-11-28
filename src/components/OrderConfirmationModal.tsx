@@ -1,18 +1,23 @@
-import { CheckCircle2, ClipboardList, ExternalLink, ShoppingBag, Star } from 'lucide-react';
+import { CheckCircle2, ClipboardList, ExternalLink, MessageCircle, ShoppingBag, Star } from 'lucide-react';
 import { formatBRL, formatDateTimeBR } from '../lib/format';
+import { buildWhatsAppOrderUrl, formatCartItemVariationLine } from '../lib/whatsappOrder';
 import type { Order } from '../types';
 
 interface OrderConfirmationModalProps {
   order: Order;
+  storeWhatsapp: string;
   onViewOrders: () => void;
   onBackToStore: () => void;
 }
 
 export function OrderConfirmationModal({
   order,
+  storeWhatsapp,
   onViewOrders,
   onBackToStore,
 }: OrderConfirmationModalProps) {
+  const whatsappUrl = buildWhatsAppOrderUrl(storeWhatsapp, order);
+
   return (
     <div className="max-w-2xl mx-auto">
       <div className="rounded-3xl border border-white/15 bg-[#0C0C0C] p-6 sm:p-10 space-y-6">
@@ -66,7 +71,7 @@ export function OrderConfirmationModal({
                   <p className="font-semibold text-white">
                     {item.quantity}x {item.name}
                   </p>
-                  <p className="text-xs text-[#9E9E9E]">Sabor / Variação: {item.variation}</p>
+                  <p className="text-xs text-[#9E9E9E]">Opção: {formatCartItemVariationLine(item)}</p>
                 </div>
                 <span className="font-bold text-white tabular-nums">
                   {formatBRL(item.price * item.quantity)}
@@ -97,11 +102,22 @@ export function OrderConfirmationModal({
           </div>
         </div>
 
-        <div className="flex flex-col sm:flex-row gap-3 pt-2">
+        <a
+          href={whatsappUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="w-full min-h-[44px] h-12 rounded-xl bg-emerald-500 text-black font-extrabold text-sm inline-flex items-center justify-center gap-2 hover:bg-emerald-400 transition-colors"
+        >
+          <MessageCircle className="w-4 h-4 shrink-0" />
+          <span>Enviar pedido no WhatsApp</span>
+          <ExternalLink className="w-3.5 h-3.5 opacity-75" />
+        </a>
+
+        <div className="flex flex-col sm:flex-row gap-3">
           <button
             type="button"
             onClick={onViewOrders}
-            className="flex-1 h-11 rounded-xl border border-white/25 text-white font-bold text-sm inline-flex items-center justify-center gap-2 hover:bg-white hover:text-black transition-colors"
+            className="flex-1 min-h-[44px] h-11 rounded-xl border border-white/25 text-white font-bold text-sm inline-flex items-center justify-center gap-2 hover:bg-white hover:text-black transition-colors"
           >
             <ClipboardList className="w-4 h-4" />
             Meus Pedidos
@@ -109,7 +125,7 @@ export function OrderConfirmationModal({
           <button
             type="button"
             onClick={onBackToStore}
-            className="flex-1 h-11 rounded-xl bg-white text-black font-bold text-sm inline-flex items-center justify-center gap-2 hover:bg-neutral-200 transition-colors"
+            className="flex-1 min-h-[44px] h-11 rounded-xl bg-white text-black font-bold text-sm inline-flex items-center justify-center gap-2 hover:bg-neutral-200 transition-colors"
           >
             <ShoppingBag className="w-4 h-4" />
             Voltar à Loja
@@ -120,7 +136,7 @@ export function OrderConfirmationModal({
           href="https://share.google/Wvlt5sHGVC4AsvTdz"
           target="_blank"
           rel="noopener noreferrer"
-          className="w-full h-11 rounded-xl border border-white/20 bg-black text-white font-bold text-xs sm:text-sm inline-flex items-center justify-center gap-2 hover:bg-white hover:text-black transition-colors"
+          className="w-full min-h-[44px] h-11 rounded-xl border border-white/20 bg-black text-white font-bold text-xs sm:text-sm inline-flex items-center justify-center gap-2 hover:bg-white hover:text-black transition-colors"
         >
           <Star className="w-4 h-4 text-amber-400 fill-amber-400" />
           <span>Avaliar nosso atendimento no Google</span>
