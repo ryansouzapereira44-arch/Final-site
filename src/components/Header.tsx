@@ -12,6 +12,7 @@ interface HeaderProps {
   cartSubtotal: number;
   rouletteAvailableCount: number;
   onNavigate: (view: AppView) => void;
+  onOpenRzin: () => void;
   onLogout: () => void;
 }
 
@@ -22,6 +23,7 @@ export function Header({
   cartSubtotal,
   rouletteAvailableCount,
   onNavigate,
+  onOpenRzin,
   onLogout,
 }: HeaderProps) {
   const isCourier = user.role === 'courier';
@@ -90,6 +92,13 @@ export function Header({
                 }`}
               >
                 Minha Conta{rouletteAvailableCount > 0 ? ` (${rouletteAvailableCount})` : ''}
+              </button>
+              <button
+                type="button"
+                onClick={onOpenRzin}
+                className="whitespace-nowrap shrink-0 pb-0.5 transition-colors text-[#9E9E9E] hover:text-white"
+              >
+                Consultor RZIN
               </button>
               {user.role === 'admin' && (
                 <button
@@ -172,6 +181,13 @@ export function Header({
               }`}
             >
               Minha Conta{rouletteAvailableCount > 0 ? ` (${rouletteAvailableCount})` : ''}
+            </button>
+            <button
+              type="button"
+              onClick={onOpenRzin}
+              className="whitespace-nowrap py-1 text-[#9E9E9E] hover:text-white"
+            >
+              RZIN IA
             </button>
             {user.role === 'admin' && (
               <button
