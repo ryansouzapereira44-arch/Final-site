@@ -1,293 +1,266 @@
-import { GoogleGenAI, ThinkingLevel, Type, type Content } from '@google/genai';
-import type { Product, RzinRecommendation } from '../src/types.ts';
-import { db, mapProductRow, mapSettingsRow } from './db.ts';
+import nodemailer, { type Transporter } from 'nodemailer';
 
-let cachedClient: GoogleGenAI | null = null;
-let cachedKey: string | undefined;
-
-function getAiClient(): GoogleGenAI {
-  const apiKey = (process.env.GEMINI_API_KEY || '').trim();
-  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
-    throw new Error(
-      'GEMINI_API_KEY não configurada no ambiente do servidor. Configure a chave em Configurações > Segredos.'
-    );
-  }
-  if (!cachedClient || cachedKey !== apiKey) {
-    cachedClient = new GoogleGenAI({
-      apiKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        },
-      },
-    });
-    cachedKey = apiKey;
-  }
-  return cachedClient;
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
-export interface RzinInputMessage {
-  role: 'user' | 'model';
-  text: string;
+export function isSmtpConfigured(): boolean {
+  const host = (process.env.SMTP_HOST || '').trim();
+  const user = (process.env.SMTP_USER || '').trim();
+  const pass = (process.env.SMTP_PASS || '').trim();
+  return Boolean(host && user && pass);
 }
 
-interface RawModelRecommendation {
-  productId?: number;
-  brandOrLine?: string;
-  variation?: string;
-  flavorDescription?: string;
-  matchReason?: string;
-}
+let cachedEtherealAccount: { user: string; pass: string } | null = null;
 
-interface RawModelResponse {
-  reply?: string;
-  recommendations?: RawModelRecommendation[];
-}
+async function getMailTransporter(): Promise<{
+  transporter: Transporter;
+  from: string;
+  isTestInbox: boolean;
+} | null> {
+  if (isSmtpConfigured()) {
+    const host = (process.env.SMTP_HOST || '').trim();
+    const port = Number(process.env.SMTP_PORT || 587);
+    const secure =
+      process.env.SMTP_SECURE === 'true' ||
+      port === 465;
+    const user = (process.env.SMTP_USER || '').trim();
+    const pass = (process.env.SMTP_PASS || '').trim();
+    const from = (process.env.SMTP_FROM || `R&P Tabacaria <${user}>`).trim();
 
-const RESPONSE_SCHEMA = {
-  type: Type.OBJECT,
-  properties: {
-    reply: {
-      type: Type.STRING,
-      description:
-        'Resposta natural, simpática e descontraída do RZIN em português do Brasil, conduzindo a conversa ou apresentando as recomendações.',
-    },
-    recommendations: {
-      type: Type.ARRAY,
-      description:
-        'Lista de produtos REAIS do catálogo recomendados nesta mensagem. Deixe vazio ([]) se ainda estiver fazendo perguntas de descoberta ou se nenhuma opção disponível combinar.',
-      items: {
-        type: Type.OBJECT,
-        properties: {
-          productId: {
-            type: Type.INTEGER,
-            description: 'ID numérico exato do produto ativo no catálogo da R&P Tabacaria.',
-          },
-          brandOrLine: {
-            type: Type.STRING,
-            description: 'Marca ou linha do produto (ex: R&P Tabacaria, Essência Premium Blend 250g, etc.).',
-          },
-          variation: {
-            type: Type.STRING,
-            description: 'Sabor ou variação exata disponível dentro de variations do produto escolhido.',
-          },
-          flavorDescription: {
-            type: Type.STRING,
-            description: 'Descrição objetiva do perfil de sabor desta essência/produto.',
-          },
-          matchReason: {
-            type: Type.STRING,
-            description: 'Explicação clara de por que combina com o gosto e restrições informados pelo cliente.',
-          },
-        },
-        required: ['productId', 'brandOrLine', 'variation', 'flavorDescription', 'matchReason'],
-      },
-    },
-  },
-  required: ['reply', 'recommendations'],
-};
-
-function buildSystemInstruction(products: Product[], storeOpen: boolean, storeName: string): string {
-  const essences = products.filter((p) => p.category.toLowerCase().includes('essênc') || p.category.toLowerCase().includes('essenc'));
-  const otherProducts = products.filter((p) => !essences.some((e) => e.id === p.id));
-
-  const catalogPayload = {
-    storeName,
-    storeCurrentlyOpen: storeOpen,
-    essencesCatalog: essences.map((p) => ({
-      id: p.id,
-      name: p.name,
-      category: p.category,
-      description: p.description,
-      priceBRL: p.price,
-      availableFlavors: p.variations,
-      secondaryOptions: p.secondaryVariations || [],
-      hasPhoto: Boolean(p.imageUrl),
-      inStock: p.active,
-    })),
-    otherAvailableProducts: otherProducts.map((p) => ({
-      id: p.id,
-      name: p.name,
-      category: p.category,
-      description: p.description,
-      priceBRL: p.price,
-      availableVariations: p.variations,
-      secondaryOptions: p.secondaryVariations || [],
-      hasPhoto: Boolean(p.imageUrl),
-      inStock: p.active,
-    })),
-  };
-
-  return `Você é o RZIN, o assistente virtual oficial e mascote da ${storeName} (um guaxinim estiloso de boné e óculos escuros da R&P).
-
-PERSONALIDADE E TOM DE VOZ:
-- Seja simpático, estiloso, descontraído, carismático e natural — como um atendente jovem e gente boa conversando direto no balcão da loja.
-- Use gírias leves e moderadas ("salve", "fechou", "massa", "curte", "bora", "combina demais"), sem exageros e sem parecer robô ou formulário.
-- Use emojis com moderação (1 a 3 por mensagem quando fizer sentido).
-- Dê explicações simples, diretas e objetivas.
-- NUNCA pressione o cliente a comprar.
-
-OBJETIVO PRINCIPAL:
-- Você é especialista no catálogo de essências da ${storeName}.
-- Ajude o cliente a descobrir qual essência (e sabor/variação) realmente disponível no catálogo combina mais com os gostos pessoais dele.
-- Se o cliente pedir outro item da loja (ex: pod, carvão, rosh, narguilé), você também pode ajudar usando os produtos reais cadastrados em otherAvailableProducts.
-
-COMO CONDUZIR A CONVERSA:
-1. Converse de forma natural e interativa. NÃO faça todas as perguntas de uma vez — faça no máximo 1 ou 2 perguntas leves por turno quando ainda precisar entender o perfil do cliente.
-2. Perguntas úteis para descobrir o perfil (use aos poucos conforme a conversa):
-   - Gosta mais de sabores doces ou cítricos?
-   - Prefere frutas vermelhas, tropicais ou mais refrescantes?
-   - Curte sabores gelados (Ice/Mint/Mentol) ou prefere sem gelo?
-   - Prefere sabores mais suaves ou marcantes?
-   - Tem alguma essência ou sabor que já experimentou e curtiu?
-3. Aprenda com tudo que o cliente disser durante o histórico da conversa (incluindo restrições como "não gosto de mentol", "sem menta", "nada muito enjoativo") e respeite essas preferências nas recomendações seguintes.
-4. Quando já tiver informação suficiente para sugerir opções reais (ou quando o cliente já disser claramente o que curte, ex: "gosto de morango, melancia e sabores docinhos"), analise o catálogo REAL abaixo e retorne as recomendações compatíveis no campo "recommendations" do JSON, explicando no "reply" o perfil identificado de forma natural.
-5. Se o cliente informar uma restrição (ex: "quero morango com uva, mas sem mentol"), filtre cuidadosamente os sabores disponíveis no catálogo evitando sabores Ice/Mint/Menthol/Hortelã.
-
-REGRAS OBRIGATÓRIAS DO CATÁLOGO (ZERO INVENÇÃO):
-- Recomende SOMENTE produtos existentes no catálogo JSON abaixo (todos estão ativos e disponíveis).
-- NUNCA invente nomes de essências, marcas inexistentes, sabores fora de availableFlavors/availableVariations ou preços diferentes dos listados.
-- NUNCA recomende produtos indisponíveis ou fora do catálogo como se estivessem à venda.
-- Se não houver nenhuma combinação adequada no catálogo atual (por exemplo, se todas as frutas disponíveis tiverem toque gelado e o cliente não quiser mentol, ou se não houver o sabor pedido), informe isso com total honestidade e transparência ao cliente, sugerindo apenas o que realmente chega mais perto se fizer sentido, sem inventar nada.
-- Use o campo "recommendations" apenas com productId e variation exatos do catálogo abaixo.
-
-REGRAS DE SEGURANÇA E CONFORMIDADE:
-- Atenda apenas adultos com idade legal (+18 anos) para adquirir produtos de tabacaria. Se o usuário mencionar ser menor de 18 anos, recuse educadamente as recomendações.
-- Respeite a legislação aplicável.
-- NUNCA faça alegações de que os produtos são seguros, saudáveis ou isentos de riscos à saúde.
-
-FORMATO DE SAÍDA:
-- Responda exclusivamente no JSON estruturado definido pelo schema ("reply" e "recommendations").
-- Seja conciso no "reply" (geralmente 2 a 5 frases curtas), deixando os detalhes estruturados (nome, marca, descrição do sabor, motivo da combinação, foto, preço e disponibilidade) aparecerem nos cards de "recommendations".
-
-CATÁLOGO REAL ATUALIZADO DA LOJA:
-${JSON.stringify(catalogPayload)}`;
-}
-
-async function generateWithRetry(
-  ai: GoogleGenAI,
-  contents: Content[],
-  systemInstruction: string
-): Promise<string> {
-  let lastError: unknown;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents,
-        config: {
-          systemInstruction,
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          responseMimeType: 'application/json',
-          responseSchema: RESPONSE_SCHEMA,
-        },
-      });
-      const text = (response.text || '').trim();
-      if (!text) {
-        throw new Error('Resposta vazia do modelo.');
-      }
-      return text;
-    } catch (err: unknown) {
-      lastError = err;
-      const status =
-        typeof err === 'object' && err !== null && 'status' in err
-          ? Number((err as { status?: unknown }).status)
-          : 0;
-      const retryable = status === 429 || status >= 500 || status === 0;
-      if (!retryable || attempt === 2) {
-        throw err;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 500 * Math.pow(2, attempt)));
-    }
-  }
-  throw lastError;
-}
-
-export async function runRzinChat(messages: RzinInputMessage[]): Promise<{
-  reply: string;
-  recommendations: RzinRecommendation[];
-}> {
-  const ai = getAiClient();
-
-  const productRows = db
-    .prepare('SELECT * FROM products WHERE active = 1 AND archived = 0 ORDER BY id DESC')
-    .all() as Record<string, unknown>[];
-  const activeProducts = productRows.map(mapProductRow);
-  const productMap = new Map<number, Product>(activeProducts.map((p) => [p.id, p]));
-
-  const settingsRow = db.prepare('SELECT * FROM store_settings WHERE id = 1').get() as Record<string, unknown>;
-  const settings = mapSettingsRow(settingsRow);
-
-  const systemInstruction = buildSystemInstruction(activeProducts, settings.storeOpen, settings.storeName);
-
-  const contents: Content[] = messages.slice(-12).map((msg) => ({
-    role: msg.role === 'model' ? 'model' : 'user',
-    parts: [{ text: msg.text }],
-  }));
-
-  const rawText = await generateWithRetry(ai, contents, systemInstruction);
-
-  let parsed: RawModelResponse;
-  try {
-    parsed = JSON.parse(rawText) as RawModelResponse;
-  } catch {
     return {
-      reply: rawText,
-      recommendations: [],
+      transporter: nodemailer.createTransport({
+        host,
+        port: Number.isFinite(port) && port > 0 ? port : 587,
+        secure,
+        auth: { user, pass },
+      }),
+      from,
+      isTestInbox: false,
     };
   }
 
-  const reply =
-    typeof parsed.reply === 'string' && parsed.reply.trim()
-      ? parsed.reply.trim()
-      : 'Salve! Me conta um pouco mais sobre os sabores que você curte pra eu achar a essência ideal no catálogo.';
+  // Fallback sandbox inbox (Ethereal) when SMTP secrets are not configured yet
+  try {
+    if (!cachedEtherealAccount) {
+      const account = await nodemailer.createTestAccount();
+      cachedEtherealAccount = { user: account.user, pass: account.pass };
+    }
+    return {
+      transporter: nodemailer.createTransport({
+        host: 'smtp.ethereal.email',
+        port: 587,
+        secure: false,
+        auth: cachedEtherealAccount,
+      }),
+      from: 'R&P Tabacaria <no-reply@rptabacaria.local>',
+      isTestInbox: true,
+    };
+  } catch {
+    return null;
+  }
+}
 
-  const rawRecs = Array.isArray(parsed.recommendations) ? parsed.recommendations : [];
-  const seenKeys = new Set<string>();
-  const verifiedRecommendations: RzinRecommendation[] = [];
-
-  for (const rec of rawRecs) {
-    const productId = Number(rec.productId);
-    if (!Number.isInteger(productId)) continue;
-    const realProduct = productMap.get(productId);
-    if (!realProduct || !realProduct.active) continue;
-
-    // Match variation against real catalog variations (case-insensitive fallback)
-    const requestedVar = typeof rec.variation === 'string' ? rec.variation.trim() : '';
-    const matchedVar =
-      realProduct.variations.find((v) => v.toLowerCase() === requestedVar.toLowerCase()) ||
-      realProduct.variations[0] ||
-      'Padrão';
-
-    const dedupeKey = `${realProduct.id}::${matchedVar.toLowerCase()}`;
-    if (seenKeys.has(dedupeKey)) continue;
-    seenKeys.add(dedupeKey);
-
-    verifiedRecommendations.push({
-      productId: realProduct.id,
-      name: realProduct.name,
-      brandOrLine:
-        typeof rec.brandOrLine === 'string' && rec.brandOrLine.trim()
-          ? rec.brandOrLine.trim()
-          : settings.storeName,
-      category: realProduct.category,
-      variation: matchedVar,
-      flavorDescription:
-        typeof rec.flavorDescription === 'string' && rec.flavorDescription.trim()
-          ? rec.flavorDescription.trim()
-          : realProduct.description || `Sabor ${matchedVar}`,
-      matchReason:
-        typeof rec.matchReason === 'string' && rec.matchReason.trim()
-          ? rec.matchReason.trim()
-          : 'Combina com o perfil de sabor que você descreveu.',
-      price: realProduct.price,
-      imageUrl: realProduct.imageUrl,
-      available: realProduct.active,
-    });
+export async function sendPasswordResetEmail(params: {
+  toEmail: string;
+  recipientName: string;
+  resetUrl: string;
+}): Promise<{ delivered: boolean; previewUrl?: string }> {
+  const parsedUrl = new URL(params.resetUrl);
+  if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+    throw new Error('Invalid reset URL protocol');
   }
 
-  return {
-    reply,
-    recommendations: verifiedRecommendations,
-  };
+  const setup = await getMailTransporter();
+  if (!setup) {
+    console.warn(
+      '[Mailer] SMTP não configurado (defina SMTP_HOST, SMTP_USER e SMTP_PASS nos Segredos para envio real de e-mails).'
+    );
+    return { delivered: false };
+  }
+
+  const safeName = escapeHtml(params.recipientName || 'Cliente');
+  const safeHref = escapeHtml(parsedUrl.toString());
+
+  const subject = 'R&P Tabacaria · Recuperação de senha';
+  const text = [
+    `Olá, ${params.recipientName || 'Cliente'}!`,
+    '',
+    'Recebemos uma solicitação para redefinir a senha da sua conta na R&P Tabacaria.',
+    'Acesse o link abaixo para cadastrar uma nova senha (válido por 30 minutos):',
+    '',
+    parsedUrl.toString(),
+    '',
+    'Se você não solicitou essa alteração, ignore este e-mail. Sua senha atual permanecerá segura.',
+  ].join('\n');
+
+  const html = `
+    <div style="background:#000000;color:#ffffff;font-family:Arial,Helvetica,sans-serif;padding:32px 16px;">
+      <div style="max-width:520px;margin:0 auto;background:#0e0e0e;border:1px solid #262626;border-radius:20px;padding:28px;">
+        <p style="margin:0 0 8px;font-size:11px;letter-spacing:2px;color:#9e9e9e;font-weight:700;">R&amp;P TABACARIA</p>
+        <h1 style="margin:0 0 16px;font-size:22px;color:#ffffff;">Recuperação de senha</h1>
+        <p style="margin:0 0 14px;font-size:14px;line-height:1.6;color:#e5e5e5;">
+          Olá, <strong>${safeName}</strong>! Recebemos uma solicitação para alterar a senha da sua conta.
+        </p>
+        <p style="margin:0 0 22px;font-size:14px;line-height:1.6;color:#9e9e9e;">
+          Clique no botão abaixo para criar uma nova senha. Este link expira em <strong>30 minutos</strong> e só pode ser usado uma vez.
+        </p>
+        <a href="${safeHref}" style="display:inline-block;background:#ffffff;color:#000000;text-decoration:none;font-weight:700;font-size:14px;padding:13px 24px;border-radius:12px;">
+          Redefinir minha senha
+        </a>
+        <p style="margin:22px 0 6px;font-size:12px;color:#9e9e9e;">Se o botão não abrir, copie e cole este endereço no navegador:</p>
+        <p style="margin:0;font-size:12px;word-break:break-all;color:#d4d4d4;">${safeHref}</p>
+        <hr style="border:none;border-top:1px solid #262626;margin:24px 0 16px;" />
+        <p style="margin:0;font-size:12px;color:#9e9e9e;">
+          Se você não solicitou a recuperação de senha, apenas ignore este e-mail.
+        </p>
+      </div>
+    </div>
+  `;
+
+  try {
+    const info = await setup.transporter.sendMail({
+      from: setup.from,
+      to: params.toEmail,
+      subject,
+      text,
+      html,
+    });
+
+    if (setup.isTestInbox) {
+      const previewUrl = nodemailer.getTestMessageUrl(info) || undefined;
+      if (previewUrl) {
+        console.info(`[Mailer] E-mail de teste (Ethereal) gerado para visualização: ${previewUrl}`);
+      }
+      return { delivered: true, previewUrl };
+    }
+    return { delivered: true };
+  } catch (err) {
+    console.error('[Mailer] Falha ao enviar e-mail de recuperação:', err);
+    return { delivered: false };
+  }
+}
+
+function getSafeStoreUrl(): string | null {
+  const raw = (process.env.APP_URL || '').trim();
+  if (!raw || raw === 'MY_APP_URL') return null;
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+      return parsed.toString();
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export async function sendRouletteCouponExpiringEmail(params: {
+  toEmail: string;
+  recipientName: string;
+  couponCode: string;
+  benefitLabel: string;
+  expiresAtIso: string;
+}): Promise<{ delivered: boolean; previewUrl?: string }> {
+  const cleanEmail = params.toEmail.trim();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+    console.warn(`[Mailer] E-mail inválido ignorado no lembrete de cupom: ${cleanEmail}`);
+    return { delivered: false };
+  }
+
+  const setup = await getMailTransporter();
+  if (!setup) {
+    console.warn(
+      '[Mailer] SMTP não configurado (defina SMTP_HOST, SMTP_USER e SMTP_PASS nos Segredos para envio real de e-mails).'
+    );
+    return { delivered: false };
+  }
+
+  const expiresDate = new Date(params.expiresAtIso);
+  const formattedExpiry = Number.isNaN(expiresDate.getTime())
+    ? params.expiresAtIso
+    : new Intl.DateTimeFormat('pt-BR', {
+        dateStyle: 'short',
+        timeStyle: 'short',
+        timeZone: 'America/Sao_Paulo',
+      }).format(expiresDate);
+
+  const recipientName = params.recipientName.trim() || 'Cliente';
+  const couponCode = params.couponCode.trim().toUpperCase();
+  const benefitLabel = params.benefitLabel.trim();
+  const storeUrl = getSafeStoreUrl();
+
+  const safeName = escapeHtml(recipientName);
+  const safeCode = escapeHtml(couponCode);
+  const safeBenefit = escapeHtml(benefitLabel);
+  const safeExpiry = escapeHtml(formattedExpiry);
+  const safeStoreUrl = storeUrl ? escapeHtml(storeUrl) : null;
+
+  const subject = `R&P Tabacaria · Falta só 1 dia para usar seu cupom ${couponCode}!`;
+  const text = [
+    `Olá, ${recipientName}!`,
+    '',
+    `Seu cupom exclusivo da Roleta R&P (${couponCode} · ${benefitLabel}) tem validade de 7 dias e chegou ao 6º dia.`,
+    `Falta só 1 dia para você aproveitar antes que ele expire em ${formattedExpiry}.`,
+    '',
+    `Código do cupom: ${couponCode}`,
+    ...(storeUrl ? ['', `Acesse a loja para usar agora: ${storeUrl}`] : []),
+    '',
+    'Aplique o código no carrinho ou no checkout antes do vencimento.',
+  ].join('\n');
+
+  const html = `
+    <div style="background:#000000;color:#ffffff;font-family:Arial,Helvetica,sans-serif;padding:32px 16px;">
+      <div style="max-width:520px;margin:0 auto;background:#0e0e0e;border:1px solid #262626;border-radius:20px;padding:28px;">
+        <p style="margin:0 0 8px;font-size:11px;letter-spacing:2px;color:#9e9e9e;font-weight:700;">R&amp;P TABACARIA · ROLETA DE PRÊMIOS</p>
+        <h1 style="margin:0 0 14px;font-size:22px;color:#ffffff;">Falta só 1 dia para usar seu cupom!</h1>
+        <p style="margin:0 0 14px;font-size:14px;line-height:1.6;color:#e5e5e5;">
+          Olá, <strong>${safeName}</strong>! Seu cupom da roleta completou 6 dias e está quase vencendo.
+        </p>
+        <p style="margin:0 0 20px;font-size:14px;line-height:1.6;color:#9e9e9e;">
+          Você tem apenas mais <strong style="color:#ffffff;">1 dia</strong> para aproveitar seu benefício antes que ele expire em <strong style="color:#ffffff;">${safeExpiry}</strong>.
+        </p>
+        <div style="background:#000000;border:1px dashed #525252;border-radius:14px;padding:18px;text-align:center;margin:0 0 20px;">
+          <p style="margin:0 0 6px;font-size:11px;letter-spacing:1.5px;color:#9e9e9e;text-transform:uppercase;">Seu cupom exclusivo (${safeBenefit})</p>
+          <p style="margin:0;font-size:24px;font-weight:800;letter-spacing:2px;color:#ffffff;">${safeCode}</p>
+        </div>
+        ${
+          safeStoreUrl
+            ? `<a href="${safeStoreUrl}" style="display:inline-block;background:#ffffff;color:#000000;text-decoration:none;font-weight:700;font-size:14px;padding:13px 24px;border-radius:12px;">Usar meu cupom agora</a>`
+            : ''
+        }
+        <hr style="border:none;border-top:1px solid #262626;margin:24px 0 16px;" />
+        <p style="margin:0;font-size:12px;color:#9e9e9e;">
+          Válido para uso único na sua conta até ${safeExpiry}. Caso já tenha utilizado, desconsidere este aviso.
+        </p>
+      </div>
+    </div>
+  `;
+
+  try {
+    const info = await setup.transporter.sendMail({
+      from: setup.from,
+      to: cleanEmail,
+      subject,
+      text,
+      html,
+    });
+
+    if (setup.isTestInbox) {
+      const previewUrl = nodemailer.getTestMessageUrl(info) || undefined;
+      if (previewUrl) {
+        console.info(`[Mailer] Lembrete de cupom (Ethereal) para ${cleanEmail}: ${previewUrl}`);
+      }
+      return { delivered: true, previewUrl };
+    }
+    return { delivered: true };
+  } catch (err) {
+    console.error(`[Mailer] Falha ao enviar lembrete de cupom ${couponCode}:`, err);
+    return { delivered: false };
+  }
 }
