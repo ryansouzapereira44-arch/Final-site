@@ -17,6 +17,7 @@ export interface User {
   savedAddress: DeliveryAddress | null;
   role: UserRole;
   active?: boolean;
+  welcomeCampaignSeen?: boolean;
   createdAt: string;
 }
 
@@ -31,15 +32,33 @@ export interface CourierSummary {
 
 export interface Product {
   id: number;
+  sku?: string;
   name: string;
   category: string;
   description: string;
   price: number;
+  costPrice?: number;
+  freightCostUnit?: number;
+  packagingCostUnit?: number;
+  otherCostUnit?: number;
+  purchasedQuantity?: number;
+  stockQuantity?: number;
+  archived?: boolean;
+  archivedAt?: string | null;
   imageUrl: string;
+  variationLabel?: string;
   variations: string[];
+  secondaryVariationLabel?: string;
+  secondaryVariations?: string[];
   active: boolean;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface CustomerSummary {
+  id: number;
+  name: string;
+  email: string;
 }
 
 export interface Coupon {
@@ -50,6 +69,8 @@ export interface Coupon {
   minOrderValue: number;
   freeShipping: boolean;
   ownerUserId: number | null;
+  allowedEmail: string | null;
+  allowMultipleUses: boolean;
   maxUses: number | null;
   expiresAt: string | null;
   active: boolean;
@@ -244,4 +265,152 @@ export interface RouletteStateResponse {
     activeList: RouletteChance[];
   };
   spins: RouletteSpin[];
+}
+
+export interface RzinRecommendation {
+  productId: number;
+  name: string;
+  brandOrLine: string;
+  category: string;
+  variation: string;
+  flavorDescription: string;
+  matchReason: string;
+  price: number;
+  imageUrl: string;
+  available: boolean;
+}
+
+export interface RzinChatMessage {
+  id: string;
+  role: 'user' | 'model';
+  text: string;
+  recommendations?: RzinRecommendation[];
+}
+
+export type ProfitSortOption =
+  | 'highest_profit_unit'
+  | 'highest_margin'
+  | 'highest_potential_profit'
+  | 'lowest_margin';
+
+export interface ProfitProductRow {
+  id: number;
+  sku: string;
+  name: string;
+  category: string;
+  description: string;
+  imageUrl: string;
+  variations: string[];
+  active: boolean;
+  price: number;
+  costPrice: number;
+  freightCostUnit: number;
+  packagingCostUnit: number;
+  otherCostUnit: number;
+  totalAdditionalCostUnit: number;
+  totalUnitCost: number;
+  purchasedQuantity: number;
+  stockQuantity: number;
+  profitPerUnit: number;
+  marginPercent: number;
+  markupPercent: number;
+  potentialCost: number;
+  potentialRevenue: number;
+  potentialProfit: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ProfitCategorySummary {
+  category: string;
+  productCount: number;
+  totalUnits: number;
+  totalInvested: number;
+  potentialRevenue: number;
+  potentialProfit: number;
+  avgMarginPercent: number;
+}
+
+export interface ProfitIndicators {
+  totalInvested: number;
+  potentialRevenue: number;
+  potentialGrossProfit: number;
+  averageMarginPercent: number;
+  totalStockUnits: number;
+  totalPurchasedUnits: number;
+  activeProductCount: number;
+  configuredCostCount: number;
+  mostProfitableProduct: ProfitProductRow | null;
+  lowestMarginProduct: ProfitProductRow | null;
+}
+
+export interface ProductCostBatch {
+  id: number;
+  productId: number;
+  productName: string;
+  productSku: string;
+  productArchived: boolean;
+  quantityPurchased: number;
+  remainingQuantity: number;
+  unitPurchaseCost: number;
+  freightCostUnit: number;
+  packagingCostUnit: number;
+  otherCostUnit: number;
+  totalUnitCost: number;
+  supplierNote: string;
+  purchasedAt: string;
+  createdAt: string;
+}
+
+export type ProductCostEventType =
+  | 'initial'
+  | 'manual_edit'
+  | 'batch_entry'
+  | 'price_change'
+  | 'archived';
+
+export interface ProductCostHistoryEntry {
+  id: number;
+  productId: number;
+  productNameSnapshot: string;
+  productArchived: boolean;
+  eventType: ProductCostEventType;
+  unitPurchaseCost: number;
+  freightCostUnit: number;
+  packagingCostUnit: number;
+  otherCostUnit: number;
+  totalUnitCost: number;
+  salePrice: number;
+  purchasedQuantity: number;
+  stockQuantity: number;
+  note: string;
+  recordedAt: string;
+}
+
+export interface HistoricalSaleProfitSummary {
+  ordersAnalyzed: number;
+  unitsSold: number;
+  totalSalesRevenue: number;
+  totalHistoricalCost: number;
+  totalHistoricalGrossProfit: number;
+  recentOrders: {
+    orderId: number;
+    orderNumber: number;
+    createdAt: string;
+    status: OrderStatus;
+    itemsRevenue: number;
+    historicalCost: number;
+    historicalGrossProfit: number;
+    marginPercent: number;
+  }[];
+}
+
+export interface ProfitOverviewResponse {
+  products: ProfitProductRow[];
+  indicators: ProfitIndicators;
+  categories: ProfitCategorySummary[];
+  batches: ProductCostBatch[];
+  history: ProductCostHistoryEntry[];
+  historicalSales: HistoricalSaleProfitSummary;
+  costingMethodNote: string;
 }
