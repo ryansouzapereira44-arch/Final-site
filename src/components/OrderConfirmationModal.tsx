@@ -1,4 +1,4 @@
-import { CheckCircle2, ClipboardList, ShoppingBag } from 'lucide-react';
+import { CheckCircle2, ClipboardList, ExternalLink, ShoppingBag, Star } from 'lucide-react';
 import { formatBRL, formatDateTimeBR } from '../lib/format';
 import type { Order } from '../types';
 
@@ -115,6 +115,17 @@ export function OrderConfirmationModal({
             Voltar à Loja
           </button>
         </div>
+
+        <a
+          href="https://share.google/Wvlt5sHGVC4AsvTdz"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="w-full h-11 rounded-xl border border-white/20 bg-black text-white font-bold text-xs sm:text-sm inline-flex items-center justify-center gap-2 hover:bg-white hover:text-black transition-colors"
+        >
+          <Star className="w-4 h-4 text-amber-400 fill-amber-400" />
+          <span>Avaliar nosso atendimento no Google</span>
+          <ExternalLink className="w-3.5 h-3.5 opacity-70" />
+        </a>
       </div>
     </div>
   );
