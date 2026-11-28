@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Check, Plus, Search } from 'lucide-react';
+import { Check, ChevronDown, Plus, Search } from 'lucide-react';
 import { formatBRL } from '../lib/format';
 import type { Product } from '../types';
 import { SafeProductImage } from './BrandMark';
@@ -10,6 +10,7 @@ interface CatalogSectionProps {
   selectedCategory: string;
   onSelectCategory: (category: string) => void;
   onAddToCart: (product: Product, variation: string) => void;
+  onOpenRzin?: () => void;
 }
 
 export function CatalogSection({
@@ -18,9 +19,11 @@ export function CatalogSection({
   selectedCategory,
   onSelectCategory,
   onAddToCart,
+  onOpenRzin,
 }: CatalogSectionProps) {
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedVariations, setSelectedVariations] = useState<Record<number, string>>({});
+  const [selectedSecondaryVariations, setSelectedSecondaryVariations] = useState<Record<number, string>>({});
   const [addedProductId, setAddedProductId] = useState<number | null>(null);
 
   const filteredProducts = useMemo(() => {
@@ -32,14 +35,32 @@ export function CatalogSection({
         p.name.toLowerCase().includes(q) ||
         p.description.toLowerCase().includes(q) ||
         p.category.toLowerCase().includes(q) ||
-        p.variations.some((v) => v.toLowerCase().includes(q));
+        p.variations.some((v) => v.toLowerCase().includes(q)) ||
+        (p.secondaryVariations || []).some((v) => v.toLowerCase().includes(q));
       return matchesCat && matchesQuery;
     });
   }, [products, selectedCategory, searchQuery]);
 
+  function getPrimaryVariation(product: Product): string {
+    if (product.variations.length === 0) return '';
+    const saved = selectedVariations[product.id];
+    if (saved && product.variations.includes(saved)) return saved;
+    return product.variations[0] || '';
+  }
+
+  function getSecondaryVariation(product: Product): string {
+    const secondary = product.secondaryVariations || [];
+    if (secondary.length === 0) return '';
+    const saved = selectedSecondaryVariations[product.id];
+    if (saved && secondary.includes(saved)) return saved;
+    return secondary[0] || '';
+  }
+
   function getActiveVariation(product: Product): string {
-    if (selectedVariations[product.id]) return selectedVariations[product.id];
-    return product.variations[0] || 'Padrão';
+    const primary = getPrimaryVariation(product);
+    const secondary = getSecondaryVariation(product);
+    const combined = [primary, secondary].filter(Boolean).join(' · ');
+    return combined || 'Padrão';
   }
 
   function handleAdd(product: Product) {
@@ -57,19 +78,37 @@ export function CatalogSection({
         <div>
           <h2 className="text-xl sm:text-2xl font-extrabold text-white tracking-tight">Catálogo de Produtos</h2>
           <p className="text-xs sm:text-sm text-[#9E9E9E] mt-0.5">
-            Escolha o sabor ou variação desejada e adicione ao carrinho.
+            Escolha o sabor ou variação desejada na seta de seleção e adicione ao carrinho.
           </p>
         </div>
 
-        <div className="relative w-full md:w-72">
-          <Search className="w-4 h-4 text-[#9E9E9E] absolute left-3.5 top-1/2 -translate-y-1/2" />
-          <input
-            type="search"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Buscar produto ou sabor..."
-            className="w-full h-10 pl-10 pr-4 rounded-xl bg-[#0D0D0D] border border-white/15 text-xs sm:text-sm text-white placeholder-[#9E9E9E] focus:outline-none focus:border-white transition-colors"
-          />
+        <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5 w-full md:w-auto">
+          {onOpenRzin && (
+            <button
+              type="button"
+              onClick={onOpenRzin}
+              className="h-10 px-3.5 rounded-xl bg-[#111111] border border-white/20 text-xs font-bold text-white hover:bg-white hover:text-black transition-colors inline-flex items-center justify-center gap-2 whitespace-nowrap shrink-0"
+            >
+              <img
+                src="/assets/aistudio/IMG_3605_dc04d8e0.jpeg"
+                alt="RZIN"
+                referrerPolicy="no-referrer"
+                className="w-5 h-5 rounded-full object-cover object-top"
+              />
+              <span>Dúvida na essência? Falar com RZIN</span>
+            </button>
+          )}
+
+          <div className="relative w-full md:w-72">
+            <Search className="w-4 h-4 text-[#9E9E9E] absolute left-3.5 top-1/2 -translate-y-1/2" />
+            <input
+              type="search"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Buscar produto ou sabor..."
+              className="w-full h-10 pl-10 pr-4 rounded-xl bg-[#0D0D0D] border border-white/15 text-xs sm:text-sm text-white placeholder-[#9E9E9E] focus:outline-none focus:border-white transition-colors"
+            />
+          </div>
         </div>
       </div>
 
@@ -103,7 +142,9 @@ export function CatalogSection({
       ) : (
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-2.5 sm:gap-3.5 lg:gap-4 items-stretch">
           {filteredProducts.map((product) => {
-            const activeVariation = getActiveVariation(product);
+            const primaryVariation = getPrimaryVariation(product);
+            const secondaryVariation = getSecondaryVariation(product);
+            const secondaryList = product.secondaryVariations || [];
             const isAdded = addedProductId === product.id;
 
             return (
@@ -135,33 +176,66 @@ export function CatalogSection({
                     </p>
                   )}
 
-                  {product.variations.length > 0 && (
-                    <div className="pt-0.5">
-                      <p className="text-[10px] sm:text-[11px] font-medium text-[#BDBDBD] mb-1 truncate">
-                        Sabor / Variação
-                      </p>
-                      <div className="flex flex-wrap gap-1">
-                        {product.variations.map((variation) => {
-                          const selected = activeVariation === variation;
-                          return (
-                            <button
-                              key={variation}
-                              type="button"
-                              onClick={() =>
-                                setSelectedVariations((prev) => ({ ...prev, [product.id]: variation }))
+                  {(product.variations.length > 0 || secondaryList.length > 0) && (
+                    <div className="pt-1 space-y-1.5">
+                      {product.variations.length > 0 && (
+                        <div>
+                          <label
+                            htmlFor={`var-1-${product.id}`}
+                            className="block text-[10px] sm:text-[11px] font-medium text-[#BDBDBD] mb-1 truncate"
+                          >
+                            {product.variationLabel?.trim() || 'Sabor / Variação'}
+                          </label>
+                          <div className="relative">
+                            <select
+                              id={`var-1-${product.id}`}
+                              value={primaryVariation}
+                              onChange={(e) =>
+                                setSelectedVariations((prev) => ({ ...prev, [product.id]: e.target.value }))
                               }
-                              title={variation}
-                              className={`px-1.5 sm:px-2 py-0.5 rounded-md text-[10px] sm:text-[11px] leading-tight transition-colors border max-w-full truncate ${
-                                selected
-                                  ? 'bg-white text-black border-white font-semibold'
-                                  : 'bg-black text-[#A3A3A3] border-white/15 hover:text-white hover:border-white/30'
-                              }`}
+                              className="w-full h-8 sm:h-9 pl-2.5 pr-7 rounded-lg bg-black border border-white/20 text-[11px] sm:text-xs font-medium text-white appearance-none focus:outline-none focus:border-white transition-colors truncate cursor-pointer"
                             >
-                              {variation}
-                            </button>
-                          );
-                        })}
-                      </div>
+                              {product.variations.map((variation) => (
+                                <option key={variation} value={variation} className="bg-[#0C0C0C] text-white">
+                                  {variation}
+                                </option>
+                              ))}
+                            </select>
+                            <ChevronDown className="w-3.5 h-3.5 text-white/80 pointer-events-none absolute right-2 top-1/2 -translate-y-1/2" />
+                          </div>
+                        </div>
+                      )}
+
+                      {secondaryList.length > 0 && (
+                        <div>
+                          <label
+                            htmlFor={`var-2-${product.id}`}
+                            className="block text-[10px] sm:text-[11px] font-medium text-[#BDBDBD] mb-1 truncate"
+                          >
+                            {product.secondaryVariationLabel?.trim() || '2ª Variação / Opção'}
+                          </label>
+                          <div className="relative">
+                            <select
+                              id={`var-2-${product.id}`}
+                              value={secondaryVariation}
+                              onChange={(e) =>
+                                setSelectedSecondaryVariations((prev) => ({
+                                  ...prev,
+                                  [product.id]: e.target.value,
+                                }))
+                              }
+                              className="w-full h-8 sm:h-9 pl-2.5 pr-7 rounded-lg bg-black border border-white/20 text-[11px] sm:text-xs font-medium text-white appearance-none focus:outline-none focus:border-white transition-colors truncate cursor-pointer"
+                            >
+                              {secondaryList.map((variation) => (
+                                <option key={variation} value={variation} className="bg-[#0C0C0C] text-white">
+                                  {variation}
+                                </option>
+                              ))}
+                            </select>
+                            <ChevronDown className="w-3.5 h-3.5 text-white/80 pointer-events-none absolute right-2 top-1/2 -translate-y-1/2" />
+                          </div>
+                        </div>
+                      )}
                     </div>
                   )}
 
