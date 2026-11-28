@@ -121,9 +121,10 @@ export function Header({
         <div className="flex items-center gap-2.5 shrink-0">
           {!isCourier && (
             <button
+              id="header-cart-button"
               type="button"
               onClick={() => onNavigate('cart')}
-              className="flex items-center gap-2 h-10 px-4 rounded-xl bg-white text-black font-bold text-xs sm:text-sm hover:bg-neutral-200 transition-colors whitespace-nowrap shrink-0 tabular-nums"
+              className="flex items-center gap-2 h-10 px-4 rounded-xl bg-white text-black font-bold text-xs sm:text-sm hover:bg-neutral-200 transition-all duration-200 whitespace-nowrap shrink-0 tabular-nums"
             >
               <ShoppingBag className="w-4 h-4 shrink-0" />
               <span>Carrinho ({cartCount})</span>
