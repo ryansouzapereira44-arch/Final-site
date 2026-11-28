@@ -72,14 +72,26 @@ export function EditorialCarousel({ slides, onSelectCategory }: EditorialCarouse
         )}
 
         <div className="mt-7 flex flex-wrap items-center gap-4">
-          <button
-            type="button"
-            onClick={() => onSelectCategory(current.targetCategory || 'Todos')}
-            className="inline-flex items-center gap-2 h-11 px-6 rounded-xl bg-white text-black font-bold text-sm hover:bg-neutral-200 transition-colors whitespace-nowrap"
-          >
-            <span>{current.ctaText || 'Ver catálogo'}</span>
-            <ArrowRight className="w-4 h-4" />
-          </button>
+          {current.linkUrl && current.linkUrl.trim() ? (
+            <a
+              href={current.linkUrl.trim()}
+              target={/^https?:\/\//i.test(current.linkUrl.trim()) ? '_blank' : undefined}
+              rel={/^https?:\/\//i.test(current.linkUrl.trim()) ? 'noopener noreferrer' : undefined}
+              className="inline-flex items-center gap-2 h-11 px-6 rounded-xl bg-white text-black font-bold text-sm hover:bg-neutral-200 transition-colors whitespace-nowrap"
+            >
+              <span>{current.ctaText || 'Ver destaque'}</span>
+              <ArrowRight className="w-4 h-4" />
+            </a>
+          ) : (
+            <button
+              type="button"
+              onClick={() => onSelectCategory(current.targetCategory || 'Todos')}
+              className="inline-flex items-center gap-2 h-11 px-6 rounded-xl bg-white text-black font-bold text-sm hover:bg-neutral-200 transition-colors whitespace-nowrap"
+            >
+              <span>{current.ctaText || 'Ver catálogo'}</span>
+              <ArrowRight className="w-4 h-4" />
+            </button>
+          )}
         </div>
       </div>
 
