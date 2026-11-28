@@ -1,3 +1,4 @@
+
 {
   "name": "react-example",
   "private": true,
@@ -13,10 +14,11 @@
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
+    "@supabase/supabase-js": "^2.119.2",
     "@tailwindcss/vite": "^4.3.3",
     "@types/leaflet": "^1.9.23",
     "@types/nodemailer": "^8.0.2",
-    "@vitejs/plugin-react": "^6.1.1",
+    "@vitejs/plugin-react": "^6.1.0",
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
     "leaflet": "^1.9.4",
