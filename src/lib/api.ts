@@ -1,785 +1,836 @@
-import { db, formatProductSku, mapOrderRow, mapProductRow } from './db.ts';
-import {
-  computeProductProfitMetrics,
-  computeTotalUnitCost,
-  computeWeightedAverageCost,
-  roundMoney,
-  roundPercent,
-} from '../src/lib/profitMath.ts';
 import type {
-  HistoricalSaleProfitSummary,
+  CarouselSlide,
+  CartItem,
+  Coordinates,
+  CourierSummary,
+  Coupon,
+  CustomerSummary,
+  DeliveryAddress,
+  DeliveryMethod,
+  DeliveryTrackingInfo,
+  LoyalCustomerDetail,
+  LoyalCustomerPeriod,
+  LoyalCustomersResponse,
+  LoyalCustomerSortBy,
+  Order,
+  OrderStatus,
+  PaymentMethod,
   Product,
   ProductCostBatch,
-  ProductCostEventType,
   ProductCostHistoryEntry,
-  ProfitCategorySummary,
-  ProfitIndicators,
+  ProductSuggestion,
   ProfitOverviewResponse,
   ProfitProductRow,
-} from '../src/types.ts';
+  RoulettePrize,
+  RouletteSpin,
+  RouletteStateResponse,
+  RzinRecommendation,
+  ShippingEstimate,
+  StoreSettings,
+  User,
+} from '../types';
 
-export const COSTING_METHOD_NOTE =
-  'Custo Médio Ponderado (CMP): ao registrar um novo lote de compra com custo diferente, o custo unitário é recalculado pela média ponderada entre o estoque disponível atual e as novas unidades. Histórico de custos anteriores é preservado imutavelmente.';
+export interface AuthStatusResponse {
+  adminClaimed: boolean;
+  adminEmail: string;
+  user?: User | null;
+}
 
-export function buildProfitProductRow(product: Product): ProfitProductRow {
-  const costPrice = Math.max(0, Number(product.costPrice || 0));
-  const freightCostUnit = Math.max(0, Number(product.freightCostUnit || 0));
-  const packagingCostUnit = Math.max(0, Number(product.packagingCostUnit || 0));
-  const otherCostUnit = Math.max(0, Number(product.otherCostUnit || 0));
-  const purchasedQuantity = Math.max(0, Math.round(Number(product.purchasedQuantity || 0)));
-  const stockQuantity = Math.max(0, Math.round(Number(product.stockQuantity || 0)));
+export interface AuthResponse {
+  user: User;
+  token: string;
+}
 
-  const metrics = computeProductProfitMetrics({
-    price: product.price,
-    costPrice,
-    freightCostUnit,
-    packagingCostUnit,
-    otherCostUnit,
-    purchasedQuantity,
-    stockQuantity,
-  });
+export interface StoreResponse {
+  products: Product[];
+  categories: string[];
+  slides: CarouselSlide[];
+  settings: StoreSettings;
+}
 
-  return {
-    id: product.id,
-    sku: formatProductSku(product.id, product.sku),
-    name: product.name,
-    category: product.category,
-    description: product.description,
-    imageUrl: product.imageUrl,
-    variations: product.variations,
-    active: product.active,
-    price: roundMoney(product.price),
-    costPrice: roundMoney(costPrice),
-    freightCostUnit: roundMoney(freightCostUnit),
-    packagingCostUnit: roundMoney(packagingCostUnit),
-    otherCostUnit: roundMoney(otherCostUnit),
-    totalAdditionalCostUnit: metrics.totalAdditionalCostUnit,
-    totalUnitCost: metrics.totalUnitCost,
-    purchasedQuantity,
-    stockQuantity,
-    profitPerUnit: metrics.profitPerUnit,
-    marginPercent: metrics.marginPercent,
-    markupPercent: metrics.markupPercent,
-    potentialCost: metrics.potentialCost,
-    potentialRevenue: metrics.potentialRevenue,
-    potentialProfit: metrics.potentialProfit,
-    createdAt: product.createdAt,
-    updatedAt: product.updatedAt,
+export interface AdminOverviewResponse {
+  products: Product[];
+  coupons: Coupon[];
+  slides: CarouselSlide[];
+  orders: Order[];
+  couriers: CourierSummary[];
+  customers?: CustomerSummary[];
+  suggestions?: ProductSuggestion[];
+  settings: StoreSettings;
+}
+
+export interface AdminRouletteResponse {
+  prizes: RoulettePrize[];
+  spins: RouletteSpin[];
+  totals: {
+    available: number;
+    used: number;
+    expired: number;
   };
 }
 
-export function recordProductCostSnapshot(params: {
-  productId: number;
-  productNameSnapshot: string;
-  eventType: ProductCostEventType;
-  unitPurchaseCost: number;
-  freightCostUnit: number;
-  packagingCostUnit: number;
-  otherCostUnit: number;
-  salePrice: number;
-  purchasedQuantity: number;
-  stockQuantity: number;
-  note: string;
-  recordedAt?: string;
-}): void {
-  const unitPurchaseCost = roundMoney(Math.max(0, params.unitPurchaseCost));
-  const freightCostUnit = roundMoney(Math.max(0, params.freightCostUnit));
-  const packagingCostUnit = roundMoney(Math.max(0, params.packagingCostUnit));
-  const otherCostUnit = roundMoney(Math.max(0, params.otherCostUnit));
-  const totalUnitCost = computeTotalUnitCost({
-    costPrice: unitPurchaseCost,
-    freightCostUnit,
-    packagingCostUnit,
-    otherCostUnit,
-  });
-  const salePrice = roundMoney(Math.max(0, params.salePrice));
-  const purchasedQuantity = Math.max(0, Math.round(params.purchasedQuantity));
-  const stockQuantity = Math.max(0, Math.round(params.stockQuantity));
-  const recordedAt = params.recordedAt || new Date().toISOString();
-
-  db.prepare(`
-    INSERT INTO product_cost_history (
-      productId, productNameSnapshot, eventType, unitPurchaseCost,
-      freightCostUnit, packagingCostUnit, otherCostUnit, totalUnitCost,
-      salePrice, purchasedQuantity, stockQuantity, note, recordedAt
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    params.productId,
-    params.productNameSnapshot,
-    params.eventType,
-    unitPurchaseCost,
-    freightCostUnit,
-    packagingCostUnit,
-    otherCostUnit,
-    totalUnitCost,
-    salePrice,
-    purchasedQuantity,
-    stockQuantity,
-    params.note,
-    recordedAt
-  );
+export interface CouponValidationResponse {
+  valid: boolean;
+  coupon?: Coupon;
+  discountAmount?: number;
+  message: string;
 }
 
-function getHistoricalUnitCostAt(productId: number, atIso: string): number | null {
-  const rowAtTime = db
-    .prepare(
-      `SELECT totalUnitCost FROM product_cost_history
-       WHERE productId = ? AND recordedAt <= ?
-       ORDER BY recordedAt DESC, id DESC LIMIT 1`
-    )
-    .get(productId, atIso) as { totalUnitCost: number } | undefined;
+export interface CepLookupResponse {
+  lat: number;
+  lng: number;
+  street?: string;
+  neighborhood?: string;
+  city?: string;
+  state?: string;
+}
 
-  if (rowAtTime) {
-    return Number(rowAtTime.totalUnitCost || 0);
+type UnauthorizedHandler = () => void;
+type TokenRefreshedHandler = (user: User, token: string) => void;
+
+let unauthorizedHandler: UnauthorizedHandler | null = null;
+let tokenRefreshedHandler: TokenRefreshedHandler | null = null;
+let pendingRefreshPromise: Promise<AuthResponse | null> | null = null;
+
+async function performSilentRefresh(token?: string | null): Promise<AuthResponse | null> {
+  if (pendingRefreshPromise) {
+    return pendingRefreshPromise;
   }
-
-  const earliest = db
-    .prepare(
-      `SELECT totalUnitCost FROM product_cost_history
-       WHERE productId = ?
-       ORDER BY recordedAt ASC, id ASC LIMIT 1`
-    )
-    .get(productId) as { totalUnitCost: number } | undefined;
-
-  if (earliest) {
-    return Number(earliest.totalUnitCost || 0);
-  }
-
-  const prod = db
-    .prepare('SELECT costPrice, freightCostUnit, packagingCostUnit, otherCostUnit FROM products WHERE id = ?')
-    .get(productId) as
-    | {
-        costPrice: number;
-        freightCostUnit: number;
-        packagingCostUnit: number;
-        otherCostUnit: number;
+  pendingRefreshPromise = (async () => {
+    try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+      };
+      if (token) {
+        headers.Authorization = `Bearer ${token}`;
       }
-    | undefined;
-
-  if (!prod) return null;
-  return computeTotalUnitCost({
-    costPrice: Number(prod.costPrice || 0),
-    freightCostUnit: Number(prod.freightCostUnit || 0),
-    packagingCostUnit: Number(prod.packagingCostUnit || 0),
-    otherCostUnit: Number(prod.otherCostUnit || 0),
-  });
-}
-
-function computeHistoricalSalesSummary(): HistoricalSaleProfitSummary {
-  const orderRows = db
-    .prepare("SELECT * FROM orders WHERE status != 'Cancelado' ORDER BY id DESC LIMIT 200")
-    .all() as Record<string, unknown>[];
-
-  let unitsSold = 0;
-  let totalSalesRevenue = 0;
-  let totalHistoricalCost = 0;
-  const recentOrders: HistoricalSaleProfitSummary['recentOrders'] = [];
-
-  for (const row of orderRows) {
-    const order = mapOrderRow(row);
-    let orderItemsRevenue = 0;
-    let orderHistoricalCost = 0;
-
-    for (const item of order.items) {
-      const qty = Math.max(0, Math.round(Number(item.quantity || 0)));
-      const unitSale = Math.max(0, Number(item.price || 0));
-      const lineRevenue = roundMoney(unitSale * qty);
-      const historicalUnitCost = getHistoricalUnitCostAt(item.productId, order.createdAt) ?? 0;
-      const lineCost = roundMoney(historicalUnitCost * qty);
-
-      unitsSold += qty;
-      orderItemsRevenue = roundMoney(orderItemsRevenue + lineRevenue);
-      orderHistoricalCost = roundMoney(orderHistoricalCost + lineCost);
-    }
-
-    const orderGrossProfit = roundMoney(orderItemsRevenue - orderHistoricalCost);
-    const marginPercent =
-      orderItemsRevenue > 0 ? roundPercent((orderGrossProfit / orderItemsRevenue) * 100) : 0;
-
-    totalSalesRevenue = roundMoney(totalSalesRevenue + orderItemsRevenue);
-    totalHistoricalCost = roundMoney(totalHistoricalCost + orderHistoricalCost);
-
-    if (recentOrders.length < 15) {
-      recentOrders.push({
-        orderId: order.id,
-        orderNumber: order.orderNumber,
-        createdAt: order.createdAt,
-        status: order.status,
-        itemsRevenue: orderItemsRevenue,
-        historicalCost: orderHistoricalCost,
-        historicalGrossProfit: orderGrossProfit,
-        marginPercent,
+      const res = await fetch('/api/auth/refresh', {
+        method: 'POST',
+        credentials: 'include',
+        cache: 'no-store',
+        headers,
       });
-    }
-  }
-
-  return {
-    ordersAnalyzed: orderRows.length,
-    unitsSold,
-    totalSalesRevenue,
-    totalHistoricalCost,
-    totalHistoricalGrossProfit: roundMoney(totalSalesRevenue - totalHistoricalCost),
-    recentOrders,
-  };
-}
-
-export function getProfitOverview(): ProfitOverviewResponse {
-  const productRows = db
-    .prepare('SELECT * FROM products WHERE archived = 0 ORDER BY id DESC')
-    .all() as Record<string, unknown>[];
-
-  const products = productRows.map(mapProductRow).map(buildProfitProductRow);
-
-  let totalInvested = 0;
-  let potentialRevenue = 0;
-  let potentialGrossProfit = 0;
-  let totalStockUnits = 0;
-  let totalPurchasedUnits = 0;
-
-  for (const p of products) {
-    totalInvested = roundMoney(totalInvested + p.potentialCost);
-    potentialRevenue = roundMoney(potentialRevenue + p.potentialRevenue);
-    potentialGrossProfit = roundMoney(potentialGrossProfit + p.potentialProfit);
-    totalStockUnits += p.stockQuantity;
-    totalPurchasedUnits += p.purchasedQuantity;
-  }
-
-  const configuredProducts = products.filter((p) => p.totalUnitCost > 0);
-  const marginSource = configuredProducts.length > 0 ? configuredProducts : products.filter((p) => p.price > 0);
-  const averageMarginPercent =
-    marginSource.length > 0
-      ? roundPercent(marginSource.reduce((acc, p) => acc + p.marginPercent, 0) / marginSource.length)
-      : 0;
-
-  const rankingSource = configuredProducts.length > 0 ? configuredProducts : products;
-
-  let mostProfitableProduct: ProfitProductRow | null = null;
-  if (rankingSource.length > 0) {
-    mostProfitableProduct = [...rankingSource].sort((a, b) => {
-      if (b.potentialProfit !== a.potentialProfit) return b.potentialProfit - a.potentialProfit;
-      return b.profitPerUnit - a.profitPerUnit;
-    })[0];
-  }
-
-  let lowestMarginProduct: ProfitProductRow | null = null;
-  if (rankingSource.length > 0) {
-    lowestMarginProduct = [...rankingSource].sort((a, b) => {
-      if (a.marginPercent !== b.marginPercent) return a.marginPercent - b.marginPercent;
-      return a.profitPerUnit - b.profitPerUnit;
-    })[0];
-  }
-
-  const indicators: ProfitIndicators = {
-    totalInvested,
-    potentialRevenue,
-    potentialGrossProfit,
-    averageMarginPercent,
-    totalStockUnits,
-    totalPurchasedUnits,
-    activeProductCount: products.length,
-    configuredCostCount: configuredProducts.length,
-    mostProfitableProduct,
-    lowestMarginProduct,
-  };
-
-  // Group by category
-  const catMap = new Map<
-    string,
-    {
-      productCount: number;
-      totalUnits: number;
-      totalInvested: number;
-      potentialRevenue: number;
-      potentialProfit: number;
-      marginSum: number;
-      marginCount: number;
-    }
-  >();
-
-  for (const p of products) {
-    const key = p.category || 'Sem categoria';
-    const cur = catMap.get(key) || {
-      productCount: 0,
-      totalUnits: 0,
-      totalInvested: 0,
-      potentialRevenue: 0,
-      potentialProfit: 0,
-      marginSum: 0,
-      marginCount: 0,
-    };
-    cur.productCount += 1;
-    cur.totalUnits += p.stockQuantity;
-    cur.totalInvested = roundMoney(cur.totalInvested + p.potentialCost);
-    cur.potentialRevenue = roundMoney(cur.potentialRevenue + p.potentialRevenue);
-    cur.potentialProfit = roundMoney(cur.potentialProfit + p.potentialProfit);
-    if (p.totalUnitCost > 0 || configuredProducts.length === 0) {
-      cur.marginSum += p.marginPercent;
-      cur.marginCount += 1;
-    }
-    catMap.set(key, cur);
-  }
-
-  const categories: ProfitCategorySummary[] = Array.from(catMap.entries())
-    .map(([category, v]) => ({
-      category,
-      productCount: v.productCount,
-      totalUnits: v.totalUnits,
-      totalInvested: v.totalInvested,
-      potentialRevenue: v.potentialRevenue,
-      potentialProfit: v.potentialProfit,
-      avgMarginPercent: v.marginCount > 0 ? roundPercent(v.marginSum / v.marginCount) : 0,
-    }))
-    .sort((a, b) => b.potentialProfit - a.potentialProfit);
-
-  const batchRows = db
-    .prepare(
-      `SELECT b.*, p.name as productName, p.sku as productSku, p.archived as productArchived
-       FROM product_cost_batches b
-       LEFT JOIN products p ON p.id = b.productId
-       ORDER BY b.id DESC LIMIT 100`
-    )
-    .all() as Record<string, unknown>[];
-
-  const batches: ProductCostBatch[] = batchRows.map((r) => ({
-    id: Number(r.id),
-    productId: Number(r.productId),
-    productName: String(r.productName || `Produto #${r.productId}`),
-    productSku: formatProductSku(Number(r.productId), r.productSku),
-    productArchived: Boolean(r.productArchived),
-    quantityPurchased: Number(r.quantityPurchased || 0),
-    remainingQuantity: Number(r.remainingQuantity || 0),
-    unitPurchaseCost: Number(r.unitPurchaseCost || 0),
-    freightCostUnit: Number(r.freightCostUnit || 0),
-    packagingCostUnit: Number(r.packagingCostUnit || 0),
-    otherCostUnit: Number(r.otherCostUnit || 0),
-    totalUnitCost: Number(r.totalUnitCost || 0),
-    supplierNote: String(r.supplierNote || ''),
-    purchasedAt: String(r.purchasedAt),
-    createdAt: String(r.createdAt),
-  }));
-
-  const historyRows = db
-    .prepare(
-      `SELECT h.*, p.archived as productArchived
-       FROM product_cost_history h
-       LEFT JOIN products p ON p.id = h.productId
-       ORDER BY h.id DESC LIMIT 150`
-    )
-    .all() as Record<string, unknown>[];
-
-  const history: ProductCostHistoryEntry[] = historyRows.map((r) => ({
-    id: Number(r.id),
-    productId: Number(r.productId),
-    productNameSnapshot: String(r.productNameSnapshot || `Produto #${r.productId}`),
-    productArchived: Boolean(r.productArchived),
-    eventType: String(r.eventType) as ProductCostEventType,
-    unitPurchaseCost: Number(r.unitPurchaseCost || 0),
-    freightCostUnit: Number(r.freightCostUnit || 0),
-    packagingCostUnit: Number(r.packagingCostUnit || 0),
-    otherCostUnit: Number(r.otherCostUnit || 0),
-    totalUnitCost: Number(r.totalUnitCost || 0),
-    salePrice: Number(r.salePrice || 0),
-    purchasedQuantity: Number(r.purchasedQuantity || 0),
-    stockQuantity: Number(r.stockQuantity || 0),
-    note: String(r.note || ''),
-    recordedAt: String(r.recordedAt),
-  }));
-
-  const historicalSales = computeHistoricalSalesSummary();
-
-  return {
-    products,
-    indicators,
-    categories,
-    batches,
-    history,
-    historicalSales,
-    costingMethodNote: COSTING_METHOD_NOTE,
-  };
-}
-
-export function getProductProfitDetail(productId: number): {
-  product: ProfitProductRow;
-  batches: ProductCostBatch[];
-  history: ProductCostHistoryEntry[];
-} | null {
-  const row = db
-    .prepare('SELECT * FROM products WHERE id = ? AND archived = 0')
-    .get(productId) as Record<string, unknown> | undefined;
-  if (!row) return null;
-
-  const product = buildProfitProductRow(mapProductRow(row));
-  const batchRows = db
-    .prepare(
-      `SELECT b.*, p.name as productName, p.sku as productSku, p.archived as productArchived
-       FROM product_cost_batches b
-       LEFT JOIN products p ON p.id = b.productId
-       WHERE b.productId = ?
-       ORDER BY b.id DESC`
-    )
-    .all(productId) as Record<string, unknown>[];
-
-  const batches: ProductCostBatch[] = batchRows.map((r) => ({
-    id: Number(r.id),
-    productId: Number(r.productId),
-    productName: String(r.productName || product.name),
-    productSku: formatProductSku(Number(r.productId), r.productSku),
-    productArchived: Boolean(r.productArchived),
-    quantityPurchased: Number(r.quantityPurchased || 0),
-    remainingQuantity: Number(r.remainingQuantity || 0),
-    unitPurchaseCost: Number(r.unitPurchaseCost || 0),
-    freightCostUnit: Number(r.freightCostUnit || 0),
-    packagingCostUnit: Number(r.packagingCostUnit || 0),
-    otherCostUnit: Number(r.otherCostUnit || 0),
-    totalUnitCost: Number(r.totalUnitCost || 0),
-    supplierNote: String(r.supplierNote || ''),
-    purchasedAt: String(r.purchasedAt),
-    createdAt: String(r.createdAt),
-  }));
-
-  const historyRows = db
-    .prepare(
-      `SELECT h.*, p.archived as productArchived
-       FROM product_cost_history h
-       LEFT JOIN products p ON p.id = h.productId
-       WHERE h.productId = ?
-       ORDER BY h.id DESC`
-    )
-    .all(productId) as Record<string, unknown>[];
-
-  const history: ProductCostHistoryEntry[] = historyRows.map((r) => ({
-    id: Number(r.id),
-    productId: Number(r.productId),
-    productNameSnapshot: String(r.productNameSnapshot || product.name),
-    productArchived: Boolean(r.productArchived),
-    eventType: String(r.eventType) as ProductCostEventType,
-    unitPurchaseCost: Number(r.unitPurchaseCost || 0),
-    freightCostUnit: Number(r.freightCostUnit || 0),
-    packagingCostUnit: Number(r.packagingCostUnit || 0),
-    otherCostUnit: Number(r.otherCostUnit || 0),
-    totalUnitCost: Number(r.totalUnitCost || 0),
-    salePrice: Number(r.salePrice || 0),
-    purchasedQuantity: Number(r.purchasedQuantity || 0),
-    stockQuantity: Number(r.stockQuantity || 0),
-    note: String(r.note || ''),
-    recordedAt: String(r.recordedAt),
-  }));
-
-  return { product, batches, history };
-}
-
-export function updateProductProfitData(
-  productId: number,
-  input: {
-    sku?: string;
-    price?: number;
-    costPrice?: number;
-    freightCostUnit?: number;
-    packagingCostUnit?: number;
-    otherCostUnit?: number;
-    purchasedQuantity?: number;
-    stockQuantity?: number;
-    note?: string;
-  }
-): ProfitProductRow {
-  const existingRow = db
-    .prepare('SELECT * FROM products WHERE id = ? AND archived = 0')
-    .get(productId) as Record<string, unknown> | undefined;
-
-  if (!existingRow) {
-    throw new Error('Produto não encontrado ou arquivado.');
-  }
-
-  const existing = mapProductRow(existingRow);
-
-  const nextSku =
-    typeof input.sku === 'string' && input.sku.trim()
-      ? input.sku.trim().toUpperCase().slice(0, 40)
-      : formatProductSku(productId, existing.sku);
-
-  const nextPrice =
-    input.price !== undefined ? roundMoney(Number(input.price)) : roundMoney(existing.price);
-  if (!Number.isFinite(nextPrice) || nextPrice <= 0) {
-    throw new Error('O preço de venda deve ser maior que zero.');
-  }
-
-  const nextCostPrice =
-    input.costPrice !== undefined
-      ? roundMoney(Math.max(0, Number(input.costPrice)))
-      : roundMoney(existing.costPrice || 0);
-  const nextFreight =
-    input.freightCostUnit !== undefined
-      ? roundMoney(Math.max(0, Number(input.freightCostUnit)))
-      : roundMoney(existing.freightCostUnit || 0);
-  const nextPackaging =
-    input.packagingCostUnit !== undefined
-      ? roundMoney(Math.max(0, Number(input.packagingCostUnit)))
-      : roundMoney(existing.packagingCostUnit || 0);
-  const nextOther =
-    input.otherCostUnit !== undefined
-      ? roundMoney(Math.max(0, Number(input.otherCostUnit)))
-      : roundMoney(existing.otherCostUnit || 0);
-  const nextPurchased =
-    input.purchasedQuantity !== undefined
-      ? Math.max(0, Math.round(Number(input.purchasedQuantity)))
-      : Math.max(0, Math.round(Number(existing.purchasedQuantity || 0)));
-  const nextStock =
-    input.stockQuantity !== undefined
-      ? Math.max(0, Math.round(Number(input.stockQuantity)))
-      : Math.max(0, Math.round(Number(existing.stockQuantity || 0)));
-
-  if (
-    !Number.isFinite(nextCostPrice) ||
-    !Number.isFinite(nextFreight) ||
-    !Number.isFinite(nextPackaging) ||
-    !Number.isFinite(nextOther)
-  ) {
-    throw new Error('Os valores de custo devem ser numéricos e válidos.');
-  }
-
-  const now = new Date().toISOString();
-  const onlyPriceChanged =
-    nextPrice !== roundMoney(existing.price) &&
-    nextCostPrice === roundMoney(existing.costPrice || 0) &&
-    nextFreight === roundMoney(existing.freightCostUnit || 0) &&
-    nextPackaging === roundMoney(existing.packagingCostUnit || 0) &&
-    nextOther === roundMoney(existing.otherCostUnit || 0);
-
-  db.exec('BEGIN IMMEDIATE');
-  try {
-    db.prepare(`
-      UPDATE products SET
-        sku = ?,
-        price = ?,
-        costPrice = ?,
-        freightCostUnit = ?,
-        packagingCostUnit = ?,
-        otherCostUnit = ?,
-        purchasedQuantity = ?,
-        stockQuantity = ?,
-        updatedAt = ?
-      WHERE id = ?
-    `).run(
-      nextSku,
-      nextPrice,
-      nextCostPrice,
-      nextFreight,
-      nextPackaging,
-      nextOther,
-      nextPurchased,
-      nextStock,
-      now,
-      productId
-    );
-
-    recordProductCostSnapshot({
-      productId,
-      productNameSnapshot: existing.name,
-      eventType: onlyPriceChanged ? 'price_change' : 'manual_edit',
-      unitPurchaseCost: nextCostPrice,
-      freightCostUnit: nextFreight,
-      packagingCostUnit: nextPackaging,
-      otherCostUnit: nextOther,
-      salePrice: nextPrice,
-      purchasedQuantity: nextPurchased,
-      stockQuantity: nextStock,
-      note:
-        (typeof input.note === 'string' && input.note.trim()) ||
-        (onlyPriceChanged
-          ? 'Atualização de preço de venda (custo preservado)'
-          : 'Atualização de custos e estoque no R&P Profit Manager'),
-      recordedAt: now,
-    });
-
-    db.exec('COMMIT');
-  } catch (err) {
-    try {
-      db.exec('ROLLBACK');
+      if (!res.ok) return null;
+      const data = (await res.json()) as AuthResponse;
+      if (data?.user && data?.token && tokenRefreshedHandler) {
+        tokenRefreshedHandler(data.user, data.token);
+      }
+      return data;
     } catch {
-      // ignore
+      return null;
+    } finally {
+      pendingRefreshPromise = null;
     }
-    throw err;
-  }
-
-  const updatedRow = db.prepare('SELECT * FROM products WHERE id = ?').get(productId) as Record<
-    string,
-    unknown
-  >;
-  return buildProfitProductRow(mapProductRow(updatedRow));
+  })();
+  return pendingRefreshPromise;
 }
 
-export function registerProductBatch(
-  productId: number,
-  input: {
-    quantityPurchased: number;
-    unitPurchaseCost: number;
-    freightCostUnit?: number;
-    packagingCostUnit?: number;
-    otherCostUnit?: number;
-    supplierNote?: string;
-    purchasedAt?: string;
+async function request<T>(
+  url: string,
+  options: RequestInit = {},
+  token?: string | null,
+  allowRefreshRetry = true
+): Promise<T> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'X-Requested-With': 'XMLHttpRequest',
+    ...((options.headers as Record<string, string>) || {}),
+  };
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      ...options,
+      credentials: 'include',
+      cache: 'no-store',
+      headers,
+    });
+  } catch {
+    throw new Error('Sem conexão com a internet. Verifique sua rede e tente novamente.');
+  }
+
+  const isAuthEndpoint = url.startsWith('/api/auth/');
+  if (res.status === 401 && allowRefreshRetry && !isAuthEndpoint) {
+    const refreshed = await performSilentRefresh(token);
+    if (refreshed?.token) {
+      return request<T>(url, options, refreshed.token, false);
+    }
+    if (unauthorizedHandler) {
+      unauthorizedHandler();
+    }
+    throw new Error('Sua sessão expirou. Faça login novamente sem fechar o formulário.');
+  }
+
+  if (res.status === 401 && !isAuthEndpoint && unauthorizedHandler) {
+    unauthorizedHandler();
+  }
+
+  if (res.status === 413) {
+    throw new Error('Arquivo muito grande para envio. Escolha uma imagem menor.');
+  }
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error((data && (data.error || data.message)) || 'Erro ao comunicar com o servidor.');
+  }
+  return data as T;
+}
+
+export const api = {
+  setSessionCallbacks(handlers: {
+    onUnauthorized?: UnauthorizedHandler | null;
+    onTokenRefreshed?: TokenRefreshedHandler | null;
+  }) {
+    unauthorizedHandler = handlers.onUnauthorized ?? null;
+    tokenRefreshedHandler = handlers.onTokenRefreshed ?? null;
   },
-  adminId?: number
-): { product: ProfitProductRow; batch: ProductCostBatch } {
-  const existingRow = db
-    .prepare('SELECT * FROM products WHERE id = ? AND archived = 0')
-    .get(productId) as Record<string, unknown> | undefined;
 
-  if (!existingRow) {
-    throw new Error('Produto não encontrado ou arquivado.');
-  }
-
-  const existing = mapProductRow(existingRow);
-  const quantityPurchased = Math.round(Number(input.quantityPurchased));
-  const unitPurchaseCost = roundMoney(Number(input.unitPurchaseCost));
-  const freightCostUnit = roundMoney(Math.max(0, Number(input.freightCostUnit || 0)));
-  const packagingCostUnit = roundMoney(Math.max(0, Number(input.packagingCostUnit || 0)));
-  const otherCostUnit = roundMoney(Math.max(0, Number(input.otherCostUnit || 0)));
-  const supplierNote =
-    typeof input.supplierNote === 'string' ? input.supplierNote.trim().slice(0, 200) : '';
-
-  if (!Number.isInteger(quantityPurchased) || quantityPurchased < 1) {
-    throw new Error('A quantidade comprada do lote deve ser de pelo menos 1 unidade.');
-  }
-  if (!Number.isFinite(unitPurchaseCost) || unitPurchaseCost < 0) {
-    throw new Error('O valor de compra por unidade deve ser válido e não negativo.');
-  }
-
-  const now = new Date().toISOString();
-  const purchasedAt =
-    typeof input.purchasedAt === 'string' && input.purchasedAt.trim()
-      ? input.purchasedAt.trim()
-      : now;
-
-  const batchTotalUnitCost = computeTotalUnitCost({
-    costPrice: unitPurchaseCost,
-    freightCostUnit,
-    packagingCostUnit,
-    otherCostUnit,
-  });
-
-  const weighted = computeWeightedAverageCost({
-    currentStockQuantity: Number(existing.stockQuantity || 0),
-    currentCostPrice: Number(existing.costPrice || 0),
-    currentFreightCostUnit: Number(existing.freightCostUnit || 0),
-    currentPackagingCostUnit: Number(existing.packagingCostUnit || 0),
-    currentOtherCostUnit: Number(existing.otherCostUnit || 0),
-    batchQuantity: quantityPurchased,
-    batchUnitPurchaseCost: unitPurchaseCost,
-    batchFreightCostUnit: freightCostUnit,
-    batchPackagingCostUnit: packagingCostUnit,
-    batchOtherCostUnit: otherCostUnit,
-  });
-
-  const nextPurchasedTotal = Math.max(0, Number(existing.purchasedQuantity || 0)) + quantityPurchased;
-
-  let batchId = 0;
-  db.exec('BEGIN IMMEDIATE');
-  try {
-    const insertRes = db
-      .prepare(`
-        INSERT INTO product_cost_batches (
-          productId, quantityPurchased, remainingQuantity, unitPurchaseCost,
-          freightCostUnit, packagingCostUnit, otherCostUnit, totalUnitCost,
-          supplierNote, purchasedAt, createdAt, createdByAdminId
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `)
-      .run(
-        productId,
-        quantityPurchased,
-        quantityPurchased,
-        unitPurchaseCost,
-        freightCostUnit,
-        packagingCostUnit,
-        otherCostUnit,
-        batchTotalUnitCost,
-        supplierNote,
-        purchasedAt,
-        now,
-        adminId ?? null
-      );
-
-    batchId = Number(insertRes.lastInsertRowid);
-
-    db.prepare(`
-      UPDATE products SET
-        costPrice = ?,
-        freightCostUnit = ?,
-        packagingCostUnit = ?,
-        otherCostUnit = ?,
-        purchasedQuantity = ?,
-        stockQuantity = ?,
-        updatedAt = ?
-      WHERE id = ?
-    `).run(
-      weighted.nextCostPrice,
-      weighted.nextFreightCostUnit,
-      weighted.nextPackagingCostUnit,
-      weighted.nextOtherCostUnit,
-      nextPurchasedTotal,
-      weighted.nextStockQuantity,
-      now,
-      productId
+  refreshSession(token?: string | null): Promise<AuthResponse> {
+    return request<AuthResponse>(
+      '/api/auth/refresh',
+      {
+        method: 'POST',
+      },
+      token,
+      false
     );
+  },
 
-    recordProductCostSnapshot({
-      productId,
-      productNameSnapshot: existing.name,
-      eventType: 'batch_entry',
-      unitPurchaseCost: weighted.nextCostPrice,
-      freightCostUnit: weighted.nextFreightCostUnit,
-      packagingCostUnit: weighted.nextPackagingCostUnit,
-      otherCostUnit: weighted.nextOtherCostUnit,
-      salePrice: existing.price,
-      purchasedQuantity: nextPurchasedTotal,
-      stockQuantity: weighted.nextStockQuantity,
-      note: supplierNote
-        ? `Lote +${quantityPurchased} un. (${supplierNote}) — CMP aplicado`
-        : `Lote +${quantityPurchased} un. a R$ ${batchTotalUnitCost.toFixed(2).replace('.', ',')} — CMP aplicado`,
-      recordedAt: now,
+  getAuthStatus(): Promise<AuthStatusResponse> {
+    return request<AuthStatusResponse>('/api/auth/status');
+  },
+
+  getMe(): Promise<{ user: User }> {
+    return request<{ user: User }>('/api/auth/me');
+  },
+
+  register(payload: { name: string; email: string; whatsapp: string; password: string }): Promise<AuthResponse> {
+    return request<AuthResponse>('/api/auth/register', {
+      method: 'POST',
+      body: JSON.stringify(payload),
     });
+  },
 
-    db.exec('COMMIT');
-  } catch (err) {
-    try {
-      db.exec('ROLLBACK');
-    } catch {
-      // ignore
+  login(payload: { email: string; password: string }): Promise<AuthResponse> {
+    return request<AuthResponse>('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  forgotPassword(email: string): Promise<{ ok: boolean; message: string }> {
+    return request<{ ok: boolean; message: string }>('/api/auth/forgot-password', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    });
+  },
+
+  validateResetToken(token: string): Promise<{ valid: boolean; emailHint?: string }> {
+    return request<{ valid: boolean; emailHint?: string }>(
+      `/api/auth/reset-password/validate?token=${encodeURIComponent(token)}`
+    );
+  },
+
+  resetPassword(payload: {
+    token: string;
+    password: string;
+    confirmPassword: string;
+  }): Promise<{ ok: boolean; message: string }> {
+    return request<{ ok: boolean; message: string }>('/api/auth/reset-password', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  logout(): Promise<{ ok: boolean }> {
+    return request<{ ok: boolean }>('/api/auth/logout', {
+      method: 'POST',
+    });
+  },
+
+  updateProfile(
+    token: string | null,
+    payload: {
+      name: string;
+      whatsapp: string;
+      cpf: string;
+      savedAddress: DeliveryAddress | null;
     }
-    throw err;
-  }
+  ): Promise<{ user: User }> {
+    return request<{ user: User }>(
+      '/api/account/profile',
+      {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      },
+      token
+    );
+  },
 
-  const updatedRow = db.prepare('SELECT * FROM products WHERE id = ?').get(productId) as Record<
-    string,
-    unknown
-  >;
-  const batchRow = db
-    .prepare(
-      `SELECT b.*, p.name as productName, p.sku as productSku, p.archived as productArchived
-       FROM product_cost_batches b
-       LEFT JOIN products p ON p.id = b.productId
-       WHERE b.id = ?`
-    )
-    .get(batchId) as Record<string, unknown>;
+  markWelcomeSeen(token: string | null): Promise<{ user: User }> {
+    return request<{ user: User }>(
+      '/api/account/welcome-seen',
+      {
+        method: 'POST',
+      },
+      token
+    );
+  },
 
-  const product = buildProfitProductRow(mapProductRow(updatedRow));
-  const batch: ProductCostBatch = {
-    id: Number(batchRow.id),
-    productId: Number(batchRow.productId),
-    productName: String(batchRow.productName || product.name),
-    productSku: formatProductSku(Number(batchRow.productId), batchRow.productSku),
-    productArchived: Boolean(batchRow.productArchived),
-    quantityPurchased: Number(batchRow.quantityPurchased),
-    remainingQuantity: Number(batchRow.remainingQuantity),
-    unitPurchaseCost: Number(batchRow.unitPurchaseCost),
-    freightCostUnit: Number(batchRow.freightCostUnit),
-    packagingCostUnit: Number(batchRow.packagingCostUnit),
-    otherCostUnit: Number(batchRow.otherCostUnit),
-    totalUnitCost: Number(batchRow.totalUnitCost),
-    supplierNote: String(batchRow.supplierNote || ''),
-    purchasedAt: String(batchRow.purchasedAt),
-    createdAt: String(batchRow.createdAt),
-  };
+  lookupCep(token: string | null, cep: string): Promise<CepLookupResponse> {
+    const clean = cep.replace(/\D/g, '');
+    return request<CepLookupResponse>(`/api/cep/${clean}`, {}, token);
+  },
 
-  return { product, batch };
-}
+  getStore(token: string | null): Promise<StoreResponse> {
+    return request<StoreResponse>('/api/store', {}, token);
+  },
+
+  submitSuggestion(token: string | null, suggestion: string): Promise<{ suggestion: ProductSuggestion }> {
+    return request<{ suggestion: ProductSuggestion }>(
+      '/api/suggestions',
+      {
+        method: 'POST',
+        body: JSON.stringify({ suggestion }),
+      },
+      token
+    );
+  },
+
+  estimateShipping(
+    token: string | null,
+    payload: {
+      cep: string;
+      subtotalAfterDiscount: number;
+      deliveryMethod: DeliveryMethod;
+      coords: Coordinates | null;
+      freeShippingByCoupon?: boolean;
+    }
+  ): Promise<ShippingEstimate> {
+    return request<ShippingEstimate>(
+      '/api/shipping/estimate',
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      },
+      token
+    );
+  },
+
+  validateCoupon(token: string | null, code: string, subtotal: number): Promise<CouponValidationResponse> {
+    return request<CouponValidationResponse>(
+      '/api/coupons/validate',
+      {
+        method: 'POST',
+        body: JSON.stringify({ code, subtotal }),
+      },
+      token
+    );
+  },
+
+  chatWithRzin(
+    token: string | null,
+    messages: { role: 'user' | 'model'; text: string }[]
+  ): Promise<{ reply: string; recommendations: RzinRecommendation[] }> {
+    return request<{ reply: string; recommendations: RzinRecommendation[] }>(
+      '/api/rzin/chat',
+      {
+        method: 'POST',
+        body: JSON.stringify({ messages }),
+      },
+      token
+    );
+  },
+
+  createOrder(
+    token: string | null,
+    payload: {
+      customerName: string;
+      customerWhatsapp: string;
+      customerCpf: string;
+      deliveryMethod: DeliveryMethod;
+      address: DeliveryAddress | null;
+      coords: Coordinates | null;
+      paymentMethod: PaymentMethod;
+      changeFor: string;
+      couponCode: string;
+      notes: string;
+      items: CartItem[];
+    }
+  ): Promise<{ order: Order }> {
+    return request<{ order: Order }>(
+      '/api/orders',
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      },
+      token
+    );
+  },
+
+  getMyOrders(token: string | null): Promise<{ orders: Order[] }> {
+    return request<{ orders: Order[] }>('/api/orders/mine', {}, token);
+  },
+
+  getOrderTracking(token: string | null, orderId: number): Promise<{ tracking: DeliveryTrackingInfo }> {
+    return request<{ tracking: DeliveryTrackingInfo }>(`/api/orders/${orderId}/tracking`, {}, token);
+  },
+
+  // Courier (Motoboy)
+  getCourierOrders(token: string | null): Promise<{ orders: Order[] }> {
+    return request<{ orders: Order[] }>('/api/courier/orders', {}, token);
+  },
+
+  startCourierTracking(
+    token: string | null,
+    orderId: number
+  ): Promise<{ tracking: DeliveryTrackingInfo }> {
+    return request<{ tracking: DeliveryTrackingInfo }>(
+      `/api/courier/orders/${orderId}/tracking/start`,
+      { method: 'POST' },
+      token
+    );
+  },
+
+  sendCourierLocation(
+    token: string | null,
+    orderId: number,
+    payload:
+      | { lat: number; lng: number; accuracy?: number | null; heading?: number | null; speed?: number | null }
+      | { gpsStatus: 'unavailable' }
+  ): Promise<{ tracking: DeliveryTrackingInfo }> {
+    return request<{ tracking: DeliveryTrackingInfo }>(
+      `/api/courier/orders/${orderId}/location`,
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      },
+      token
+    );
+  },
+
+  stopCourierTracking(
+    token: string | null,
+    orderId: number,
+    markDelivered: boolean
+  ): Promise<{ order: Order; tracking: DeliveryTrackingInfo }> {
+    return request<{ order: Order; tracking: DeliveryTrackingInfo }>(
+      `/api/courier/orders/${orderId}/tracking/stop`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ markDelivered }),
+      },
+      token
+    );
+  },
+
+  // Roulette
+  getRoulette(token: string | null): Promise<RouletteStateResponse> {
+    return request<RouletteStateResponse>('/api/roulette', {}, token);
+  },
+
+  spinRoulette(
+    token: string | null
+  ): Promise<{
+    prize: RoulettePrize;
+    prizeIndex: number;
+    couponCode: string | null;
+    couponExpiresAt: string | null;
+    spin: RouletteSpin;
+    state: RouletteStateResponse;
+  }> {
+    return request(
+      '/api/roulette/spin',
+      {
+        method: 'POST',
+      },
+      token
+    );
+  },
+
+  // Admin
+  getAdminOverview(token: string | null): Promise<AdminOverviewResponse> {
+    return request<AdminOverviewResponse>('/api/admin/overview', {}, token);
+  },
+
+  getAdminRoulette(token: string | null): Promise<AdminRouletteResponse> {
+    return request<AdminRouletteResponse>('/api/admin/roulette', {}, token);
+  },
+
+  updateAdminRoulettePrize(
+    token: string | null,
+    prizeId: number,
+    payload: {
+      label: string;
+      shortLabel: string;
+      discountValue: number;
+      weight: number;
+      active: boolean;
+    }
+  ): Promise<{ prize: RoulettePrize }> {
+    return request<{ prize: RoulettePrize }>(
+      `/api/admin/roulette/prizes/${prizeId}`,
+      {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      },
+      token
+    );
+  },
+
+  toggleStoreStatus(
+    token: string | null,
+    storeOpen: boolean,
+    closedMessage?: string
+  ): Promise<{ settings: StoreSettings }> {
+    return request<{ settings: StoreSettings }>(
+      '/api/admin/store-status',
+      {
+        method: 'PATCH',
+        body: JSON.stringify({ storeOpen, closedMessage }),
+      },
+      token
+    );
+  },
+
+  saveProduct(
+    token: string | null,
+    product: Omit<Product, 'id' | 'createdAt' | 'updatedAt'> & { id?: number }
+  ): Promise<{ product: Product }> {
+    const isEdit = typeof product.id === 'number';
+    return request<{ product: Product }>(
+      isEdit ? `/api/admin/products/${product.id}` : '/api/admin/products',
+      {
+        method: isEdit ? 'PUT' : 'POST',
+        body: JSON.stringify(product),
+      },
+      token
+    );
+  },
+
+  deleteProduct(token: string | null, id: number): Promise<{ deleted: boolean }> {
+    return request<{ deleted: boolean }>(`/api/admin/products/${id}`, { method: 'DELETE' }, token);
+  },
+
+  saveCoupon(
+    token: string | null,
+    coupon: Omit<
+      Coupon,
+      'id' | 'usageCount' | 'createdAt' | 'freeShipping' | 'ownerUserId' | 'maxUses' | 'expiresAt'
+    > & {
+      id?: number;
+    }
+  ): Promise<{ coupon: Coupon }> {
+    const isEdit = typeof coupon.id === 'number';
+    return request<{ coupon: Coupon }>(
+      isEdit ? `/api/admin/coupons/${coupon.id}` : '/api/admin/coupons',
+      {
+        method: isEdit ? 'PUT' : 'POST',
+        body: JSON.stringify(coupon),
+      },
+      token
+    );
+  },
+
+  deleteCoupon(token: string | null, id: number): Promise<{ deleted: boolean }> {
+    return request<{ deleted: boolean }>(`/api/admin/coupons/${id}`, { method: 'DELETE' }, token);
+  },
+
+  uploadAdminImage(
+    token: string | null,
+    dataUrl: string,
+    folder: 'carousel' | 'products' = 'carousel'
+  ): Promise<{ imageUrl: string; storagePath?: string }> {
+    return request<{ imageUrl: string; storagePath?: string }>(
+      '/api/admin/upload-image',
+      {
+        method: 'POST',
+        body: JSON.stringify({ dataUrl, folder }),
+      },
+      token
+    );
+  },
+
+  saveSlide(
+    token: string | null,
+    slide: Omit<CarouselSlide, 'id' | 'createdAt' | 'updatedAt'> & { id?: number }
+  ): Promise<{ slide: CarouselSlide }> {
+    const isEdit = typeof slide.id === 'number';
+    return request<{ slide: CarouselSlide }>(
+      isEdit ? `/api/admin/carousel/${slide.id}` : '/api/admin/carousel',
+      {
+        method: isEdit ? 'PUT' : 'POST',
+        body: JSON.stringify(slide),
+      },
+      token
+    );
+  },
+
+  deleteSlide(token: string | null, id: number): Promise<{ deleted: boolean }> {
+    return request<{ deleted: boolean }>(`/api/admin/carousel/${id}`, { method: 'DELETE' }, token);
+  },
+
+  saveSettings(token: string | null, settings: StoreSettings): Promise<{ settings: StoreSettings }> {
+    return request<{ settings: StoreSettings }>(
+      '/api/admin/settings',
+      {
+        method: 'PUT',
+        body: JSON.stringify(settings),
+      },
+      token
+    );
+  },
+
+  updateOrderStatus(
+    token: string | null,
+    orderId: number,
+    status: OrderStatus,
+    assignedCourierId?: number | null
+  ): Promise<{ order: Order; chancesGranted?: number }> {
+    return request<{ order: Order; chancesGranted?: number }>(
+      `/api/admin/orders/${orderId}/status`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({ status, assignedCourierId }),
+      },
+      token
+    );
+  },
+
+  getAdminCouriers(token: string | null): Promise<{ couriers: CourierSummary[] }> {
+    return request<{ couriers: CourierSummary[] }>('/api/admin/couriers', {}, token);
+  },
+
+  createAdminCourier(
+    token: string | null,
+    payload: { name: string; email: string; whatsapp: string; password: string }
+  ): Promise<{ courier: CourierSummary }> {
+    return request<{ courier: CourierSummary }>(
+      '/api/admin/couriers',
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      },
+      token
+    );
+  },
+
+  toggleCourierActive(
+    token: string | null,
+    courierId: number,
+    active: boolean
+  ): Promise<{ courier: CourierSummary }> {
+    return request<{ courier: CourierSummary }>(
+      `/api/admin/couriers/${courierId}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({ active }),
+      },
+      token
+    );
+  },
+
+  updateAdminCourier(
+    token: string | null,
+    courierId: number,
+    payload: { name: string; email: string; whatsapp: string; active: boolean; password?: string }
+  ): Promise<{ courier: CourierSummary }> {
+    return request<{ courier: CourierSummary }>(
+      `/api/admin/couriers/${courierId}`,
+      {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      },
+      token
+    );
+  },
+
+  deleteAdminCourier(token: string | null, courierId: number): Promise<{ deleted: boolean }> {
+    return request<{ deleted: boolean }>(
+      `/api/admin/couriers/${courierId}`,
+      {
+        method: 'DELETE',
+      },
+      token
+    );
+  },
+
+  assignOrderCourier(
+    token: string | null,
+    orderId: number,
+    courierId: number | null
+  ): Promise<{ order: Order }> {
+    return request<{ order: Order }>(
+      `/api/admin/orders/${orderId}/assign-courier`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({ courierId }),
+      },
+      token
+    );
+  },
+
+  deleteAdminSuggestion(token: string | null, id: number): Promise<{ deleted: boolean }> {
+    return request<{ deleted: boolean }>(`/api/admin/suggestions/${id}`, { method: 'DELETE' }, token);
+  },
+
+  // R&P Profit Manager (Admin only)
+  getProfitOverview(token: string | null): Promise<ProfitOverviewResponse> {
+    return request<ProfitOverviewResponse>('/api/admin/profit/overview', {}, token);
+  },
+
+  getProfitProductDetail(
+    token: string | null,
+    productId: number
+  ): Promise<{
+    product: ProfitProductRow;
+    batches: ProductCostBatch[];
+    history: ProductCostHistoryEntry[];
+  }> {
+    return request(`/api/admin/profit/products/${productId}`, {}, token);
+  },
+
+  updateProfitProduct(
+    token: string | null,
+    productId: number,
+    payload: {
+      sku?: string;
+      price?: number;
+      costPrice?: number;
+      freightCostUnit?: number;
+      packagingCostUnit?: number;
+      otherCostUnit?: number;
+      purchasedQuantity?: number;
+      stockQuantity?: number;
+      note?: string;
+    }
+  ): Promise<{ product: ProfitProductRow }> {
+    return request<{ product: ProfitProductRow }>(
+      `/api/admin/profit/products/${productId}`,
+      {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      },
+      token
+    );
+  },
+
+  createProfitBatch(
+    token: string | null,
+    productId: number,
+    payload: {
+      quantityPurchased: number;
+      unitPurchaseCost: number;
+      freightCostUnit?: number;
+      packagingCostUnit?: number;
+      otherCostUnit?: number;
+      supplierNote?: string;
+      purchasedAt?: string;
+    }
+  ): Promise<{ product: ProfitProductRow; batch: ProductCostBatch }> {
+    return request<{ product: ProfitProductRow; batch: ProductCostBatch }>(
+      `/api/admin/profit/products/${productId}/batches`,
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      },
+      token
+    );
+  },
+
+  // Clientes Mais Fiéis (Admin only)
+  getLoyalCustomers(
+    token: string | null,
+    params: {
+      period: LoyalCustomerPeriod;
+      startDate?: string;
+      endDate?: string;
+      sortBy: LoyalCustomerSortBy;
+      search?: string;
+      neighborhood?: string;
+      inactiveOnly?: boolean;
+      page?: number;
+      pageSize?: number;
+    }
+  ): Promise<LoyalCustomersResponse> {
+    const qs = new URLSearchParams();
+    qs.set('period', params.period);
+    qs.set('sortBy', params.sortBy);
+    if (params.startDate) qs.set('startDate', params.startDate);
+    if (params.endDate) qs.set('endDate', params.endDate);
+    if (params.search) qs.set('search', params.search);
+    if (params.neighborhood) qs.set('neighborhood', params.neighborhood);
+    if (params.inactiveOnly) qs.set('inactiveOnly', 'true');
+    if (params.page) qs.set('page', String(params.page));
+    if (params.pageSize) qs.set('pageSize', String(params.pageSize));
+    return request<LoyalCustomersResponse>(`/api/admin/loyal-customers?${qs.toString()}`, {}, token);
+  },
+
+  getLoyalCustomerDetail(token: string | null, userId: number): Promise<LoyalCustomerDetail> {
+    return request<LoyalCustomerDetail>(`/api/admin/loyal-customers/${userId}`, {}, token);
+  },
+
+  async exportLoyalCustomersCsv(
+    token: string | null,
+    params: {
+      period: LoyalCustomerPeriod;
+      startDate?: string;
+      endDate?: string;
+      sortBy: LoyalCustomerSortBy;
+      search?: string;
+      neighborhood?: string;
+      inactiveOnly?: boolean;
+    }
+  ): Promise<{ blob: Blob; filename: string }> {
+    const qs = new URLSearchParams();
+    qs.set('period', params.period);
+    qs.set('sortBy', params.sortBy);
+    if (params.startDate) qs.set('startDate', params.startDate);
+    if (params.endDate) qs.set('endDate', params.endDate);
+    if (params.search) qs.set('search', params.search);
+    if (params.neighborhood) qs.set('neighborhood', params.neighborhood);
+    if (params.inactiveOnly) qs.set('inactiveOnly', 'true');
+
+    const url = `/api/admin/loyal-customers/export?${qs.toString()}`;
+    const doFetch = async (bearer?: string | null) => {
+      try {
+        return await fetch(url, {
+          method: 'GET',
+          credentials: 'include',
+          cache: 'no-store',
+          headers: {
+            'X-Requested-With': 'XMLHttpRequest',
+            ...(bearer ? { Authorization: `Bearer ${bearer}` } : {}),
+          },
+        });
+      } catch {
+        throw new Error('Sem conexão com a internet. Verifique sua rede e tente novamente.');
+      }
+    };
+
+    let res = await doFetch(token);
+    if (res.status === 401) {
+      const refreshed = await performSilentRefresh(token);
+      if (refreshed?.token) {
+        res = await doFetch(refreshed.token);
+      } else {
+        if (unauthorizedHandler) unauthorizedHandler();
+        throw new Error('Sua sessão expirou. Faça login novamente para exportar.');
+      }
+    }
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      throw new Error((errData && (errData.error || errData.message)) || 'Erro ao exportar CSV.');
+    }
+
+    const blob = await res.blob();
+    const disp = res.headers.get('content-disposition') || '';
+    const match = /filename="?([^"]+)"?/i.exec(disp);
+    const filename = match?.[1] || `clientes-mais-fieis-${new Date().toISOString().slice(0, 10)}.csv`;
+    return { blob, filename };
+  },
+};
