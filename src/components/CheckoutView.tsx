@@ -307,6 +307,9 @@ export function CheckoutView({
       return 'O CPF informado não é válido (ou deixe em branco, pois é opcional).';
     }
     if (draft.deliveryMethod === 'Entrega') {
+      if (settings.minDeliveryOrder > 0 && subtotal < settings.minDeliveryOrder) {
+        return `Pedido mínimo para entrega é de ${formatBRL(settings.minDeliveryOrder)}. Adicione mais itens ou escolha Retirada na loja.`;
+      }
       if (!draft.address.street.trim()) return 'Informe a rua para entrega.';
       if (!draft.address.number.trim()) return 'Informe o número para entrega.';
       if (!draft.address.neighborhood.trim()) return 'Informe o bairro para entrega.';
