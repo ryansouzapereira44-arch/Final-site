@@ -145,3 +145,122 @@ export async function sendPasswordResetEmail(params: {
     return { delivered: false };
   }
 }
+
+function getSafeStoreUrl(): string | null {
+  const raw = (process.env.APP_URL || '').trim();
+  if (!raw || raw === 'MY_APP_URL') return null;
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+      return parsed.toString();
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export async function sendRouletteCouponExpiringEmail(params: {
+  toEmail: string;
+  recipientName: string;
+  couponCode: string;
+  benefitLabel: string;
+  expiresAtIso: string;
+}): Promise<{ delivered: boolean; previewUrl?: string }> {
+  const cleanEmail = params.toEmail.trim();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+    console.warn(`[Mailer] E-mail inválido ignorado no lembrete de cupom: ${cleanEmail}`);
+    return { delivered: false };
+  }
+
+  const setup = await getMailTransporter();
+  if (!setup) {
+    console.warn(
+      '[Mailer] SMTP não configurado (defina SMTP_HOST, SMTP_USER e SMTP_PASS nos Segredos para envio real de e-mails).'
+    );
+    return { delivered: false };
+  }
+
+  const expiresDate = new Date(params.expiresAtIso);
+  const formattedExpiry = Number.isNaN(expiresDate.getTime())
+    ? params.expiresAtIso
+    : new Intl.DateTimeFormat('pt-BR', {
+        dateStyle: 'short',
+        timeStyle: 'short',
+        timeZone: 'America/Sao_Paulo',
+      }).format(expiresDate);
+
+  const recipientName = params.recipientName.trim() || 'Cliente';
+  const couponCode = params.couponCode.trim().toUpperCase();
+  const benefitLabel = params.benefitLabel.trim();
+  const storeUrl = getSafeStoreUrl();
+
+  const safeName = escapeHtml(recipientName);
+  const safeCode = escapeHtml(couponCode);
+  const safeBenefit = escapeHtml(benefitLabel);
+  const safeExpiry = escapeHtml(formattedExpiry);
+  const safeStoreUrl = storeUrl ? escapeHtml(storeUrl) : null;
+
+  const subject = `R&P Tabacaria · Falta só 1 dia para usar seu cupom ${couponCode}!`;
+  const text = [
+    `Olá, ${recipientName}!`,
+    '',
+    `Seu cupom exclusivo da Roleta R&P (${couponCode} · ${benefitLabel}) tem validade de 7 dias e chegou ao 6º dia.`,
+    `Falta só 1 dia para você aproveitar antes que ele expire em ${formattedExpiry}.`,
+    '',
+    `Código do cupom: ${couponCode}`,
+    ...(storeUrl ? ['', `Acesse a loja para usar agora: ${storeUrl}`] : []),
+    '',
+    'Aplique o código no carrinho ou no checkout antes do vencimento.',
+  ].join('\n');
+
+  const html = `
+    <div style="background:#000000;color:#ffffff;font-family:Arial,Helvetica,sans-serif;padding:32px 16px;">
+      <div style="max-width:520px;margin:0 auto;background:#0e0e0e;border:1px solid #262626;border-radius:20px;padding:28px;">
+        <p style="margin:0 0 8px;font-size:11px;letter-spacing:2px;color:#9e9e9e;font-weight:700;">R&amp;P TABACARIA · ROLETA DE PRÊMIOS</p>
+        <h1 style="margin:0 0 14px;font-size:22px;color:#ffffff;">Falta só 1 dia para usar seu cupom!</h1>
+        <p style="margin:0 0 14px;font-size:14px;line-height:1.6;color:#e5e5e5;">
+          Olá, <strong>${safeName}</strong>! Seu cupom da roleta completou 6 dias e está quase vencendo.
+        </p>
+        <p style="margin:0 0 20px;font-size:14px;line-height:1.6;color:#9e9e9e;">
+          Você tem apenas mais <strong style="color:#ffffff;">1 dia</strong> para aproveitar seu benefício antes que ele expire em <strong style="color:#ffffff;">${safeExpiry}</strong>.
+        </p>
+        <div style="background:#000000;border:1px dashed #525252;border-radius:14px;padding:18px;text-align:center;margin:0 0 20px;">
+          <p style="margin:0 0 6px;font-size:11px;letter-spacing:1.5px;color:#9e9e9e;text-transform:uppercase;">Seu cupom exclusivo (${safeBenefit})</p>
+          <p style="margin:0;font-size:24px;font-weight:800;letter-spacing:2px;color:#ffffff;">${safeCode}</p>
+        </div>
+        ${
+          safeStoreUrl
+            ? `<a href="${safeStoreUrl}" style="display:inline-block;background:#ffffff;color:#000000;text-decoration:none;font-weight:700;font-size:14px;padding:13px 24px;border-radius:12px;">Usar meu cupom agora</a>`
+            : ''
+        }
+        <hr style="border:none;border-top:1px solid #262626;margin:24px 0 16px;" />
+        <p style="margin:0;font-size:12px;color:#9e9e9e;">
+          Válido para uso único na sua conta até ${safeExpiry}. Caso já tenha utilizado, desconsidere este aviso.
+        </p>
+      </div>
+    </div>
+  `;
+
+  try {
+    const info = await setup.transporter.sendMail({
+      from: setup.from,
+      to: cleanEmail,
+      subject,
+      text,
+      html,
+    });
+
+    if (setup.isTestInbox) {
+      const previewUrl = nodemailer.getTestMessageUrl(info) || undefined;
+      if (previewUrl) {
+        console.info(`[Mailer] Lembrete de cupom (Ethereal) para ${cleanEmail}: ${previewUrl}`);
+      }
+      return { delivered: true, previewUrl };
+    }
+    return { delivered: true };
+  } catch (err) {
+    console.error(`[Mailer] Falha ao enviar lembrete de cupom ${couponCode}:`, err);
+    return { delivered: false };
+  }
+}
