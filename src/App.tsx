@@ -19,8 +19,10 @@ import { MyAccountView, type AccountSubTab } from './components/MyAccountView';
 import { MyOrdersView } from './components/MyOrdersView';
 import { OrderConfirmationModal } from './components/OrderConfirmationModal';
 import { RzinAssistant } from './components/RzinAssistant';
+import { SuggestionBoxSection } from './components/SuggestionBoxSection';
 import { WelcomeCampaignModal } from './components/WelcomeCampaignModal';
 import { api } from './lib/api';
+import { getMaxQuantityForCartLine, getRemainingAddableForCard } from './lib/stock';
 import type {
   CarouselSlide,
   CartItem,
@@ -118,6 +120,11 @@ export default function App() {
   const [liveSyncCounter, setLiveSyncCounter] = useState(0);
   const [rzinOpen, setRzinOpen] = useState(false);
   const [welcomeModalOpen, setWelcomeModalOpen] = useState(false);
+  const [sessionExpiredModalOpen, setSessionExpiredModalOpen] = useState(false);
+  const [sessionReloginEmail, setSessionReloginEmail] = useState('');
+  const [sessionReloginPassword, setSessionReloginPassword] = useState('');
+  const [sessionReloginError, setSessionReloginError] = useState('');
+  const [sessionReloginLoading, setSessionReloginLoading] = useState(false);
   const welcomeHandledUserIdRef = useRef<number | null>(null);
 
   const loadStoreData = useCallback(async (authToken: string | null) => {
@@ -179,6 +186,80 @@ export default function App() {
         : prev.address,
     }));
   }, []);
+
+  // One-time cleanup of any legacy client storage keys (catalog, couriers, slides must only load from DB)
+  useEffect(() => {
+    try {
+      const legacyKeys = [
+        'rp_products',
+        'products',
+        'rp_couriers',
+        'couriers',
+        'delivery_drivers',
+        'rp_carousel',
+        'carousel_slides',
+        'rp_slides',
+        'rp_store_cache',
+      ];
+      for (const k of legacyKeys) {
+        window.localStorage.removeItem(k);
+        window.sessionStorage.removeItem(k);
+      }
+    } catch {
+      // ignore storage access errors
+    }
+  }, []);
+
+  // Wire global session refresh & in-place re-login modal callbacks (preserves open Admin forms)
+  useEffect(() => {
+    api.setSessionCallbacks({
+      onTokenRefreshed: (refreshedUser, freshToken) => {
+        setUser(refreshedUser);
+        setToken(freshToken);
+      },
+      onUnauthorized: () => {
+        if (user) {
+          setSessionReloginEmail((prev) => prev || user.email);
+          setSessionReloginError('');
+          setSessionExpiredModalOpen(true);
+        }
+      },
+    });
+    return () => {
+      api.setSessionCallbacks({});
+    };
+  }, [user]);
+
+  // Automatic silent token refresh every 15 minutes and when returning to the tab
+  useEffect(() => {
+    if (!user) return;
+    let active = true;
+    const runRefresh = () => {
+      void api
+        .refreshSession(token)
+        .then((res) => {
+          if (!active) return;
+          setUser(res.user);
+          setToken(res.token);
+        })
+        .catch(() => {
+          // 401 handler triggers in-place re-login modal automatically
+        });
+    };
+
+    const intervalId = window.setInterval(runRefresh, 15 * 60 * 1000);
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        runRefresh();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      active = false;
+      window.clearInterval(intervalId);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+  }, [user?.id, token]);
 
   // Auto-restore login session via HttpOnly cookie if already signed in once
   useEffect(() => {
@@ -368,15 +449,35 @@ export default function App() {
     setDiscountAmount(nextDiscount);
   }, [cartSubtotal, appliedCoupon]);
 
-  function handleAddToCart(product: Product, variation: string) {
+  function handleAddToCart(
+    product: Product,
+    variation: string,
+    quantity = 1,
+    variationDetails?: CartItem['variationDetails']
+  ) {
+    const safeQuantity = Math.max(1, Math.floor(quantity));
     setConfirmedOrder(null);
     setCart((prev) => {
+      const primary = variationDetails?.primaryValue || '';
+      const secondary = variationDetails?.secondaryValue || '';
+      const { remainingAddable } = getRemainingAddableForCard(product, prev, primary, secondary);
+      if (remainingAddable <= 0) {
+        return prev;
+      }
+      const addQty = Math.min(safeQuantity, remainingAddable);
+
       const existingIndex = prev.findIndex(
         (item) => item.productId === product.id && item.variation === variation
       );
       if (existingIndex >= 0) {
         return prev.map((item, idx) =>
-          idx === existingIndex ? { ...item, quantity: item.quantity + 1 } : item
+          idx === existingIndex
+            ? {
+                ...item,
+                quantity: item.quantity + addQty,
+                ...(variationDetails ? { variationDetails } : {}),
+              }
+            : item
         );
       }
       return [
@@ -387,7 +488,8 @@ export default function App() {
           price: product.price,
           imageUrl: product.imageUrl,
           variation,
-          quantity: 1,
+          ...(variationDetails ? { variationDetails } : {}),
+          quantity: addQty,
         },
       ];
     });
@@ -396,11 +498,15 @@ export default function App() {
   function handleUpdateQuantity(productId: number, variation: string, delta: number) {
     setCart((prev) =>
       prev
-        .map((item) =>
-          item.productId === productId && item.variation === variation
-            ? { ...item, quantity: item.quantity + delta }
-            : item
-        )
+        .map((item) => {
+          if (item.productId !== productId || item.variation !== variation) return item;
+          if (delta > 0) {
+            const product = products.find((p) => p.id === productId);
+            const maxStock = getMaxQuantityForCartLine(product, prev, item);
+            return { ...item, quantity: Math.min(maxStock, item.quantity + delta) };
+          }
+          return { ...item, quantity: item.quantity + delta };
+        })
         .filter((item) => item.quantity > 0)
     );
   }
@@ -593,6 +699,7 @@ export default function App() {
         {confirmedOrder ? (
           <OrderConfirmationModal
             order={confirmedOrder}
+            storeWhatsapp={settings.storeWhatsapp}
             onViewOrders={() => handleNavigate('orders')}
             onBackToStore={() => handleNavigate('store')}
           />
@@ -612,9 +719,15 @@ export default function App() {
                   products={products}
                   categories={categories}
                   selectedCategory={selectedCategory}
+                  cart={cart}
                   onSelectCategory={setSelectedCategory}
                   onAddToCart={handleAddToCart}
                   onOpenRzin={() => setRzinOpen(true)}
+                />
+                <SuggestionBoxSection
+                  token={token}
+                  userName={user.name}
+                  userEmail={user.email}
                 />
               </>
             )}
@@ -622,7 +735,9 @@ export default function App() {
         ) : activeView === 'cart' ? (
           <CartView
             items={cart}
+            products={products}
             subtotal={cartSubtotal}
+            discountAmount={discountAmount}
             settings={settings}
             onUpdateQuantity={handleUpdateQuantity}
             onRemoveItem={handleRemoveItem}
@@ -737,6 +852,107 @@ export default function App() {
           onClose={handleCloseWelcomeModal}
           onStartShopping={handleStartShoppingFromWelcome}
         />
+      )}
+
+      {sessionExpiredModalOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="relogin-title"
+          className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
+        >
+          <form
+            onSubmit={async (e) => {
+              e.preventDefault();
+              setSessionReloginError('');
+              setSessionReloginLoading(true);
+              try {
+                const res = await api.login({
+                  email: (sessionReloginEmail || user.email).trim(),
+                  password: sessionReloginPassword,
+                });
+                setUser(res.user);
+                setToken(res.token);
+                setSessionReloginPassword('');
+                setSessionExpiredModalOpen(false);
+                setLiveNotice('Sessão renovada! Seus dados digitados foram mantidos; clique em Salvar novamente.');
+              } catch (err) {
+                setSessionReloginError(
+                  err instanceof Error ? err.message : 'E-mail ou senha inválidos.'
+                );
+              } finally {
+                setSessionReloginLoading(false);
+              }
+            }}
+            className="w-full max-w-md rounded-3xl border border-white/20 bg-[#111111] p-6 space-y-4 shadow-2xl"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h2 id="relogin-title" className="text-lg font-extrabold text-white">
+                  Sessão expirada — entrar novamente
+                </h2>
+                <p className="text-xs text-[#9E9E9E] mt-1">
+                  O que você já digitou continua aberto atrás desta janela. Confirme sua senha para continuar e salvar.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSessionExpiredModalOpen(false)}
+                aria-label="Fechar aviso de sessão"
+                className="p-1.5 rounded-lg text-[#9E9E9E] hover:text-white"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {sessionReloginError && (
+              <div role="alert" className="p-3 rounded-xl bg-red-950/70 border border-red-500/40 text-xs text-red-200">
+                {sessionReloginError}
+              </div>
+            )}
+
+            <div>
+              <label className="block text-xs font-semibold text-[#E5E5E5] mb-1">E-mail</label>
+              <input
+                type="email"
+                required
+                value={sessionReloginEmail || user.email}
+                onChange={(e) => setSessionReloginEmail(e.target.value)}
+                className="w-full h-11 px-3.5 rounded-xl bg-black border border-white/15 text-sm text-white focus:outline-none focus:border-white"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-[#E5E5E5] mb-1">Senha *</label>
+              <input
+                type="password"
+                required
+                autoFocus
+                value={sessionReloginPassword}
+                onChange={(e) => setSessionReloginPassword(e.target.value)}
+                placeholder="Digite sua senha para restaurar a sessão"
+                className="w-full h-11 px-3.5 rounded-xl bg-black border border-white/15 text-sm text-white focus:outline-none focus:border-white"
+              />
+            </div>
+
+            <div className="flex items-center justify-end gap-2.5 pt-1">
+              <button
+                type="button"
+                onClick={() => void handleLogout()}
+                className="h-10 px-4 rounded-xl border border-white/15 text-xs font-semibold text-[#9E9E9E] hover:text-white"
+              >
+                Trocar conta
+              </button>
+              <button
+                type="submit"
+                disabled={sessionReloginLoading}
+                className="h-10 px-5 rounded-xl bg-white text-black text-xs sm:text-sm font-extrabold hover:bg-neutral-200 disabled:opacity-50"
+              >
+                {sessionReloginLoading ? 'Entrando...' : 'Restaurar sessão'}
+              </button>
+            </div>
+          </form>
+        </div>
       )}
     </div>
   );
