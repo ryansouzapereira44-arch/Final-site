@@ -25,6 +25,7 @@ import {
   mapSettingsRow,
   mapSlideRow,
   mapSpinRow,
+  mapSuggestionRow,
   markUserWelcomeSeen,
   recordCouponUsage,
 } from './server/db.ts';
@@ -46,14 +47,48 @@ import {
 } from './server/auth.ts';
 import { sendPasswordResetEmail } from './server/mailer.ts';
 import {
+  ROULETTE_COUPON_VALIDITY_MS,
+  startCouponReminderScheduler,
+} from './server/couponReminders.ts';
+import {
   getProductProfitDetail,
   getProfitOverview,
   recordProductCostSnapshot,
   registerProductBatch,
   updateProductProfitData,
 } from './server/profit.ts';
+import {
+  createDriverPersistent,
+  createProductPersistent,
+  createSlidePersistent,
+  deleteDriverPersistent,
+  deleteProductPersistent,
+  deleteSlidePersistent,
+  isSupabaseConfigured,
+  listDriversPersistent,
+  listProductsPersistent,
+  listSlidesPersistent,
+  syncOrderToSupabase,
+  syncProductProfitToSupabase,
+  syncProductStockToSupabase,
+  updateDriverPersistent,
+  updateProductPersistent,
+  updateSlidePersistent,
+  uploadImageToSupabaseStorage,
+} from './server/supabaseStore.ts';
+import {
+  buildLoyalCustomersCsv,
+  getAllFilteredLoyalCustomersForExport,
+  getLoyalCustomerDetail,
+  getLoyalCustomersOverview,
+} from './server/loyalty.ts';
 import { runRzinChat, type RzinInputMessage } from './server/rzin.ts';
 import { computeTotalUnitCost } from './src/lib/profitMath.ts';
+import {
+  resolveVariationStockInfo,
+  sanitizeVariationStockMap,
+  splitVariationString,
+} from './src/lib/stock.ts';
 import { validateGpsCoordinates } from './src/lib/tracking.ts';
 import type {
   CartItem,
@@ -498,6 +533,115 @@ function evaluateCouponForUser(
   return { ok: true, discountAmount, freeShipping, message };
 }
 
+function validateOrderItemsStock(
+  items: CartItem[]
+): { ok: true } | { ok: false; error: string } {
+  const totalByProduct = new Map<number, { name: string; requested: number; available: number }>();
+  const totalByVariation = new Map<
+    string,
+    { productId: number; name: string; variationLabel: string; requested: number; available: number }
+  >();
+
+  for (const item of items) {
+    const productRow = db
+      .prepare('SELECT * FROM products WHERE id = ? AND active = 1 AND archived = 0')
+      .get(item.productId) as Record<string, unknown> | undefined;
+    if (!productRow) {
+      return { ok: false, error: `O produto "${item.name}" não está mais disponível.` };
+    }
+    const product = mapProductRow(productRow);
+    const productAvailable = Math.max(0, Math.round(Number(product.stockQuantity ?? 0)));
+
+    const prevProd = totalByProduct.get(product.id);
+    totalByProduct.set(product.id, {
+      name: product.name,
+      requested: (prevProd?.requested || 0) + item.quantity,
+      available: productAvailable,
+    });
+
+    const { stockKey, available: optionAvailable, usesOptionStock } = resolveVariationStockInfo(
+      product,
+      item.variation
+    );
+    if (usesOptionStock && stockKey) {
+      const mapKey = `${product.id}__${stockKey}`;
+      const prevVar = totalByVariation.get(mapKey);
+      totalByVariation.set(mapKey, {
+        productId: product.id,
+        name: product.name,
+        variationLabel: stockKey,
+        requested: (prevVar?.requested || 0) + item.quantity,
+        available: optionAvailable,
+      });
+    }
+  }
+
+  for (const entry of totalByVariation.values()) {
+    if (entry.available <= 0) {
+      return {
+        ok: false,
+        error: `A opção "${entry.variationLabel}" de ${entry.name} está esgotada.`,
+      };
+    }
+    if (entry.requested > entry.available) {
+      return {
+        ok: false,
+        error: `Estoque insuficiente para ${entry.name} (${entry.variationLabel}). Máximo disponível: ${entry.available}.`,
+      };
+    }
+  }
+
+  for (const entry of totalByProduct.values()) {
+    if (entry.available <= 0) {
+      return {
+        ok: false,
+        error: `O produto "${entry.name}" está esgotado no momento.`,
+      };
+    }
+    if (entry.requested > entry.available) {
+      return {
+        ok: false,
+        error: `Estoque insuficiente para ${entry.name}. Máximo disponível: ${entry.available}.`,
+      };
+    }
+  }
+
+  return { ok: true };
+}
+
+function adjustInventoryForOrderItems(items: CartItem[], direction: 'deduct' | 'restore'): void {
+  const now = new Date().toISOString();
+  for (const item of items) {
+    const productRow = db
+      .prepare('SELECT * FROM products WHERE id = ?')
+      .get(item.productId) as Record<string, unknown> | undefined;
+    if (!productRow) continue;
+    const product = mapProductRow(productRow);
+    const currentStock = Math.max(0, Math.round(Number(product.stockQuantity ?? 0)));
+    const nextStock =
+      direction === 'deduct'
+        ? Math.max(0, currentStock - item.quantity)
+        : currentStock + item.quantity;
+
+    const varStock = { ...(product.variationStock || {}) };
+    const { stockKey, usesOptionStock } = resolveVariationStockInfo(product, item.variation);
+    if (usesOptionStock && stockKey && Object.prototype.hasOwnProperty.call(varStock, stockKey)) {
+      const currentOpt = Math.max(0, Math.round(Number(varStock[stockKey] ?? 0)));
+      varStock[stockKey] =
+        direction === 'deduct'
+          ? Math.max(0, currentOpt - item.quantity)
+          : currentOpt + item.quantity;
+    }
+
+    db.prepare('UPDATE products SET stockQuantity = ?, variationStockJson = ?, updatedAt = ? WHERE id = ?').run(
+      nextStock,
+      JSON.stringify(varStock),
+      now,
+      product.id
+    );
+  }
+}
+
 function getUserRouletteState(userId: number): RouletteStateResponse {
   expireOldChances(userId);
   const prizeRows = db
@@ -557,20 +701,48 @@ async function startServer(): Promise<void> {
   const httpServer = http.createServer(app);
   app.set('trust proxy', 1);
 
-  const uploadsDir = path.resolve(process.cwd(), 'data', 'uploads');
-  if (!fs.existsSync(uploadsDir)) {
-    fs.mkdirSync(uploadsDir, { recursive: true });
-  }
-  app.use('/uploads', express.static(uploadsDir, { maxAge: '7d' }));
+  // Disable HTTP caching on API endpoints so store & admin never show stale data
+  app.use('/api', (_req, res, next) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    next();
+  });
 
-  // Admin image upload (validates raster image magic bytes and stores locally in data/uploads)
+  // Legacy read-only fallback for any pre-existing files in data/uploads
+  const legacyUploadsDir = path.resolve(process.cwd(), 'data', 'uploads');
+  if (fs.existsSync(legacyUploadsDir)) {
+    app.use('/uploads', express.static(legacyUploadsDir, { maxAge: '1h' }));
+  }
+
+  // Serve media stored in SQLite (when Supabase Storage env vars are not configured yet)
+  app.get('/api/media/:filename', (req, res) => {
+    const filename = String(req.params.filename || '').trim();
+    if (!/^[a-zA-Z0-9._-]+$/.test(filename)) {
+      res.status(400).json({ error: 'Arquivo inválido.' });
+      return;
+    }
+    const row = db
+      .prepare('SELECT mimeType, data FROM uploaded_media WHERE filename = ?')
+      .get(filename) as { mimeType: string; data: Uint8Array } | undefined;
+    if (!row) {
+      res.status(404).json({ error: 'Imagem não encontrada.' });
+      return;
+    }
+    res.setHeader('Content-Type', row.mimeType);
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    res.send(Buffer.from(row.data));
+  });
+
+  // Admin image upload (uploads to Supabase Storage when configured, otherwise SQLite uploaded_media — never ephemeral disk)
   app.post(
     '/api/admin/upload-image',
     express.json({ limit: '6mb' }),
     requireAuth,
     requireAdmin,
-    (req, res) => {
+    async (req, res) => {
       const dataUrl = typeof req.body?.dataUrl === 'string' ? req.body.dataUrl.trim() : '';
+      const folder = req.body?.folder === 'products' ? 'products' : 'carousel';
       const match = /^data:image\/(jpeg|jpg|png|webp);base64,([A-Za-z0-9+/=]+)$/.exec(dataUrl);
       if (!match) {
         res.status(400).json({ error: 'Formato de imagem inválido. Envie JPG, PNG ou WebP.' });
@@ -592,18 +764,44 @@ async function startServer(): Promise<void> {
         buffer.subarray(8, 12).toString('ascii') === 'WEBP';
 
       let ext: 'jpg' | 'png' | 'webp' | null = null;
-      if ((declaredType === 'jpeg' || declaredType === 'jpg') && isJpeg) ext = 'jpg';
-      else if (declaredType === 'png' && isPng) ext = 'png';
-      else if (declaredType === 'webp' && isWebp) ext = 'webp';
+      let mimeType: string | null = null;
+      if ((declaredType === 'jpeg' || declaredType === 'jpg') && isJpeg) {
+        ext = 'jpg';
+        mimeType = 'image/jpeg';
+      } else if (declaredType === 'png' && isPng) {
+        ext = 'png';
+        mimeType = 'image/png';
+      } else if (declaredType === 'webp' && isWebp) {
+        ext = 'webp';
+        mimeType = 'image/webp';
+      }
 
-      if (!ext) {
+      if (!ext || !mimeType) {
         res.status(400).json({ error: 'Arquivo de imagem corrompido ou não suportado.' });
         return;
       }
 
-      const filename = `slide-${Date.now()}-${crypto.randomBytes(6).toString('hex')}.${ext}`;
-      fs.writeFileSync(path.join(uploadsDir, filename), buffer);
-      res.status(201).json({ imageUrl: `/uploads/${filename}` });
+      try {
+        if (isSupabaseConfigured()) {
+          const uploaded = await uploadImageToSupabaseStorage({ buffer, mimeType, ext, folder });
+          res.status(201).json(uploaded);
+          return;
+        }
+
+        const filename = `${folder}-${Date.now()}-${crypto.randomBytes(6).toString('hex')}.${ext}`;
+        db.prepare(
+          'INSERT INTO uploaded_media (filename, mimeType, data, sizeBytes, createdAt) VALUES (?, ?, ?, ?, ?)'
+        ).run(filename, mimeType, buffer, buffer.length, new Date().toISOString());
+        res.status(201).json({ imageUrl: `/api/media/${filename}`, storagePath: '' });
+      } catch (err) {
+        console.error('Upload image error:', err);
+        res.status(500).json({
+          error:
+            err instanceof Error
+              ? err.message
+              : 'Falha ao enviar imagem para o armazenamento permanente.',
+        });
+      }
     }
   );
 
@@ -942,6 +1140,14 @@ async function startServer(): Promise<void> {
     res.json({ user: req.authUser });
   });
 
+  // Silent session renewal (keeps admin and customer sessions active across long edits)
+  app.post('/api/auth/refresh', requireAuth, (req: AuthenticatedRequest, res) => {
+    const user = req.authUser!;
+    const freshToken = signSessionToken(user);
+    setSessionCookie(res, freshToken);
+    res.json({ user, token: freshToken });
+  });
+
   // Real-time SSE notifications for automatic roulette, order status & delivery tracking sync
   app.get('/api/events', requireAuth, (req: AuthenticatedRequest, res) => {
     const authUser = req.authUser!;
@@ -1046,25 +1252,69 @@ async function startServer(): Promise<void> {
     res.json(result);
   });
 
-  // Storefront Data
-  app.get('/api/store', requireAuth, (_req, res) => {
-    const productRows = db
-      .prepare('SELECT * FROM products WHERE active = 1 AND archived = 0 ORDER BY id DESC')
-      .all() as Record<string, unknown>[];
-    const slideRows = db
-      .prepare('SELECT * FROM carousel_slides WHERE active = 1 ORDER BY sortOrder ASC, id ASC')
-      .all() as Record<string, unknown>[];
-    const settingsRow = db.prepare('SELECT * FROM store_settings WHERE id = 1').get() as Record<string, unknown>;
+  // Storefront Data (always dynamic from Supabase when configured, never cached)
+  app.get('/api/store', requireAuth, async (_req, res) => {
+    try {
+      const [allProducts, slides] = await Promise.all([
+        listProductsPersistent(true),
+        listSlidesPersistent(true),
+      ]);
+      const settingsRow = db.prepare('SELECT * FROM store_settings WHERE id = 1').get() as Record<string, unknown>;
 
-    const products = productRows.map(mapPublicProductRow);
-    const categories = ['Todos', ...Array.from(new Set(products.map((p) => p.category)))];
+      const products = allProducts.map((p) => {
+        const {
+          costPrice: _c,
+          freightCostUnit: _f,
+          packagingCostUnit: _pk,
+          otherCostUnit: _o,
+          purchasedQuantity: _pq,
+          archived: _ar,
+          archivedAt: _aa,
+          ...publicProd
+        } = p;
+        return publicProd;
+      });
+      const categories = ['Todos', ...Array.from(new Set(products.map((p) => p.category)))];
 
-    res.json({
-      products,
-      categories,
-      slides: slideRows.map(mapSlideRow),
-      settings: mapSettingsRow(settingsRow),
-    });
+      res.json({
+        products,
+        categories,
+        slides,
+        settings: mapSettingsRow(settingsRow),
+      });
+    } catch (err) {
+      console.error('Load storefront error:', err);
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Erro ao carregar produtos da loja.',
+      });
+    }
+  });
+
+  // Customer product suggestion box (verified server-side user identity)
+  app.post('/api/suggestions', requireAuth, (req: AuthenticatedRequest, res) => {
+    const authUser = req.authUser!;
+    const rawSuggestion = typeof req.body?.suggestion === 'string' ? req.body.suggestion.trim() : '';
+    if (rawSuggestion.length < 3 || rawSuggestion.length > 500) {
+      res.status(400).json({
+        error: 'Escreva uma sugestão com pelo menos 3 caracteres (máximo 500).',
+      });
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const result = db
+      .prepare(
+        `INSERT INTO product_suggestions (userId, customerName, customerEmail, suggestion, createdAt)
+         VALUES (?, ?, ?, ?, ?)`
+      )
+      .run(authUser.id, authUser.name, authUser.email, rawSuggestion, now);
+
+    const row = db
+      .prepare('SELECT * FROM product_suggestions WHERE id = ?')
+      .get(Number(result.lastInsertRowid)) as Record<string, unknown>;
+    const suggestion = mapSuggestionRow(row);
+    pushAdminEvent('store_updated', { entity: 'suggestions', action: 'created', suggestionId: suggestion.id });
+    res.status(201).json({ suggestion });
   });
 
   // Shipping distance & price estimation
@@ -1252,11 +1502,50 @@ async function startServer(): Promise<void> {
         return;
       }
       const product = mapProductRow(productRow);
+
+      if (product.variations.length > 0 && (!variation || variation === 'Padrão')) {
+        res.status(400).json({ error: `Escolha uma opção obrigatória para "${product.name}".` });
+        return;
+      }
+      const { primary: primaryPart, secondary: secondaryPart } = splitVariationString(variation);
+      if (product.variations.length > 0 && !product.variations.includes(primaryPart)) {
+        res.status(400).json({ error: `Opção inválida selecionada para "${product.name}".` });
+        return;
+      }
+      if ((product.secondaryVariations || []).length > 0) {
+        if (!secondaryPart || !(product.secondaryVariations || []).includes(secondaryPart)) {
+          res.status(400).json({ error: `Escolha a 2ª opção obrigatória para "${product.name}".` });
+          return;
+        }
+      }
+
       const lineTotal = roundMoney(product.price * quantity);
       subtotal = roundMoney(subtotal + lineTotal);
 
       const defaultVariation =
         [product.variations[0], product.secondaryVariations?.[0]].filter(Boolean).join(' · ') || 'Padrão';
+
+      const sanitizedDetails =
+        item?.variationDetails && typeof item.variationDetails === 'object'
+          ? {
+              primaryLabel:
+                typeof item.variationDetails.primaryLabel === 'string'
+                  ? item.variationDetails.primaryLabel.trim().slice(0, 60)
+                  : undefined,
+              primaryValue:
+                typeof item.variationDetails.primaryValue === 'string'
+                  ? item.variationDetails.primaryValue.trim().slice(0, 80)
+                  : undefined,
+              secondaryLabel:
+                typeof item.variationDetails.secondaryLabel === 'string'
+                  ? item.variationDetails.secondaryLabel.trim().slice(0, 60)
+                  : undefined,
+              secondaryValue:
+                typeof item.variationDetails.secondaryValue === 'string'
+                  ? item.variationDetails.secondaryValue.trim().slice(0, 80)
+                  : undefined,
+            }
+          : undefined;
 
       verifiedItems.push({
         productId: product.id,
@@ -1264,8 +1553,22 @@ async function startServer(): Promise<void> {
         price: product.price,
         imageUrl: product.imageUrl,
         variation: variation || defaultVariation,
+        ...(sanitizedDetails ? { variationDetails: sanitizedDetails } : {}),
         quantity,
       });
+    }
+
+    if (deliveryMethod === 'Entrega' && settings.minDeliveryOrder > 0 && subtotal < settings.minDeliveryOrder) {
+      res.status(400).json({
+        error: `Pedido mínimo para entrega é de R$ ${settings.minDeliveryOrder.toFixed(2).replace('.', ',')}.`,
+      });
+      return;
+    }
+
+    const preStockCheck = validateOrderItemsStock(verifiedItems);
+    if (preStockCheck.ok === false) {
+      res.status(400).json({ error: preStockCheck.error });
+      return;
     }
 
     let discountAmount = 0;
@@ -1311,6 +1614,13 @@ async function startServer(): Promise<void> {
     let createdRow: Record<string, unknown>;
     db.exec('BEGIN IMMEDIATE');
     try {
+      const txStockCheck = validateOrderItemsStock(verifiedItems);
+      if (txStockCheck.ok === false) {
+        db.exec('ROLLBACK');
+        res.status(400).json({ error: txStockCheck.error });
+        return;
+      }
+
       const now = new Date().toISOString();
       if (appliedCouponId !== null) {
         const freshRow = db.prepare('SELECT * FROM coupons WHERE id = ?').get(appliedCouponId) as
@@ -1389,6 +1699,7 @@ async function startServer(): Promise<void> {
     }
 
     const createdOrder = mapOrderRow(createdRow);
+    void syncOrderToSupabase(createdOrder, user.email);
     pushAdminEvent('order_updated', {
       orderId: createdOrder.id,
       orderNumber: createdOrder.orderNumber,
@@ -1721,7 +2032,7 @@ async function startServer(): Promise<void> {
           candidate = generatePrizeCouponCode(prize);
         }
         generatedCouponCode = candidate;
-        couponExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+        couponExpiresAt = new Date(Date.now() + ROULETTE_COUPON_VALIDITY_MS).toISOString();
         const discountType = prize.prizeType === 'free_shipping' ? 'free_shipping' : 'percent';
         const discountValue = prize.prizeType === 'free_shipping' ? 0 : prize.discountValue;
         const freeShipping = prize.prizeType === 'free_shipping' ? 1 : 0;
@@ -1779,41 +2090,174 @@ async function startServer(): Promise<void> {
 
   // ================= ADMIN ROUTES =================
 
-  app.get('/api/admin/overview', requireAuth, requireAdmin, (_req, res) => {
-    expireOldCoupons();
-    const products = (
-      db.prepare('SELECT * FROM products WHERE archived = 0 ORDER BY id DESC').all() as Record<string, unknown>[]
-    ).map(mapProductRow);
-    const coupons = (db.prepare('SELECT * FROM coupons ORDER BY id DESC').all() as Record<string, unknown>[]).map(
-      mapCouponRow
-    );
-    const slides = (
-      db.prepare('SELECT * FROM carousel_slides ORDER BY sortOrder ASC, id ASC').all() as Record<string, unknown>[]
-    ).map(mapSlideRow);
-    const orders = (db.prepare('SELECT * FROM orders ORDER BY id DESC').all() as Record<string, unknown>[]).map(
-      mapOrderRow
-    );
-    const settingsRow = db.prepare('SELECT * FROM store_settings WHERE id = 1').get() as Record<string, unknown>;
-    const couriers = listCouriers();
-    const customers = listCustomers();
+  app.get('/api/admin/overview', requireAuth, requireAdmin, async (_req, res) => {
+    try {
+      expireOldCoupons();
+      const [products, slides, couriers] = await Promise.all([
+        listProductsPersistent(false),
+        listSlidesPersistent(false),
+        listDriversPersistent(),
+      ]);
+      const coupons = (db.prepare('SELECT * FROM coupons ORDER BY id DESC').all() as Record<string, unknown>[]).map(
+        mapCouponRow
+      );
+      const orders = (db.prepare('SELECT * FROM orders ORDER BY id DESC').all() as Record<string, unknown>[]).map(
+        mapOrderRow
+      );
+      const settingsRow = db.prepare('SELECT * FROM store_settings WHERE id = 1').get() as Record<string, unknown>;
+      const customers = listCustomers();
+      const suggestions = (
+        db.prepare('SELECT * FROM product_suggestions ORDER BY id DESC LIMIT 300').all() as Record<string, unknown>[]
+      ).map(mapSuggestionRow);
 
-    res.json({
-      products,
-      coupons,
-      slides,
-      orders,
-      couriers,
-      customers,
-      settings: mapSettingsRow(settingsRow),
+      res.json({
+        products,
+        coupons,
+        slides,
+        orders,
+        couriers,
+        customers,
+        suggestions,
+        settings: mapSettingsRow(settingsRow),
+      });
+    } catch (err) {
+      console.error('Admin overview error:', err);
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Erro ao carregar dados do painel administrativo.',
+      });
+    }
+  });
+
+  app.get('/api/admin/suggestions', requireAuth, requireAdmin, (_req, res) => {
+    const suggestions = (
+      db.prepare('SELECT * FROM product_suggestions ORDER BY id DESC LIMIT 300').all() as Record<string, unknown>[]
+    ).map(mapSuggestionRow);
+    res.json({ suggestions });
+  });
+
+  app.delete('/api/admin/suggestions/:id', requireAuth, requireAdmin, (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      res.status(400).json({ error: 'ID inválido.' });
+      return;
+    }
+    const existing = db.prepare('SELECT id FROM product_suggestions WHERE id = ?').get(id);
+    if (!existing) {
+      res.status(404).json({ error: 'Sugestão não encontrada.' });
+      return;
+    }
+    db.prepare('DELETE FROM product_suggestions WHERE id = ?').run(id);
+    pushAdminEvent('store_updated', { entity: 'suggestions', action: 'deleted', suggestionId: id });
+    res.json({ deleted: true });
+  });
+
+  // Clientes Mais Fiéis (Admin-only server-side ranking, details & CSV export)
+  app.get('/api/admin/loyal-customers', requireAuth, requireAdmin, (req, res) => {
+    const rawPeriod = typeof req.query.period === 'string' ? req.query.period : 'all';
+    const validPeriods = new Set(['today', '7d', '30d', 'current_month', 'all', 'custom']);
+    const period = (validPeriods.has(rawPeriod) ? rawPeriod : 'all') as
+      | 'today'
+      | '7d'
+      | '30d'
+      | 'current_month'
+      | 'all'
+      | 'custom';
+
+    const rawSort = typeof req.query.sortBy === 'string' ? req.query.sortBy : 'total_spent';
+    const validSorts = new Set(['total_spent', 'orders_count', 'avg_ticket', 'last_order_at']);
+    const sortBy = (validSorts.has(rawSort) ? rawSort : 'total_spent') as
+      | 'total_spent'
+      | 'orders_count'
+      | 'avg_ticket'
+      | 'last_order_at';
+
+    const startDate = typeof req.query.startDate === 'string' ? req.query.startDate.trim() : undefined;
+    const endDate = typeof req.query.endDate === 'string' ? req.query.endDate.trim() : undefined;
+    const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
+    const neighborhood =
+      typeof req.query.neighborhood === 'string' ? req.query.neighborhood.trim() : '';
+    const inactiveOnly = req.query.inactiveOnly === 'true' || req.query.inactiveOnly === '1';
+    const page = Math.max(1, Math.round(Number(req.query.page || 1) || 1));
+    const pageSize = Math.min(100, Math.max(5, Math.round(Number(req.query.pageSize || 15) || 15)));
+
+    const result = getLoyalCustomersOverview({
+      period,
+      startDate,
+      endDate,
+      sortBy,
+      search,
+      neighborhood,
+      inactiveOnly,
+      page,
+      pageSize,
     });
+    res.json(result);
+  });
+
+  app.get('/api/admin/loyal-customers/export', requireAuth, requireAdmin, (req, res) => {
+    const rawPeriod = typeof req.query.period === 'string' ? req.query.period : 'all';
+    const validPeriods = new Set(['today', '7d', '30d', 'current_month', 'all', 'custom']);
+    const period = (validPeriods.has(rawPeriod) ? rawPeriod : 'all') as
+      | 'today'
+      | '7d'
+      | '30d'
+      | 'current_month'
+      | 'all'
+      | 'custom';
+
+    const rawSort = typeof req.query.sortBy === 'string' ? req.query.sortBy : 'total_spent';
+    const validSorts = new Set(['total_spent', 'orders_count', 'avg_ticket', 'last_order_at']);
+    const sortBy = (validSorts.has(rawSort) ? rawSort : 'total_spent') as
+      | 'total_spent'
+      | 'orders_count'
+      | 'avg_ticket'
+      | 'last_order_at';
+
+    const rows = getAllFilteredLoyalCustomersForExport({
+      period,
+      startDate: typeof req.query.startDate === 'string' ? req.query.startDate.trim() : undefined,
+      endDate: typeof req.query.endDate === 'string' ? req.query.endDate.trim() : undefined,
+      sortBy,
+      search: typeof req.query.search === 'string' ? req.query.search.trim() : '',
+      neighborhood:
+        typeof req.query.neighborhood === 'string' ? req.query.neighborhood.trim() : '',
+      inactiveOnly: req.query.inactiveOnly === 'true' || req.query.inactiveOnly === '1',
+    });
+
+    const csv = buildLoyalCustomersCsv(rows);
+    const stamp = new Date().toISOString().slice(0, 10);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="clientes-mais-fieis-${stamp}.csv"`);
+    res.send(csv);
+  });
+
+  app.get('/api/admin/loyal-customers/:userId', requireAuth, requireAdmin, (req, res) => {
+    const userId = Number(req.params.userId);
+    if (!Number.isInteger(userId) || userId <= 0) {
+      res.status(400).json({ error: 'ID de cliente inválido.' });
+      return;
+    }
+    const detail = getLoyalCustomerDetail(userId);
+    if (!detail) {
+      res.status(404).json({ error: 'Cliente não encontrado.' });
+      return;
+    }
+    res.json(detail);
   });
 
   // Admin Courier Accounts & Delivery Assignment
-  app.get('/api/admin/couriers', requireAuth, requireAdmin, (_req, res) => {
-    res.json({ couriers: listCouriers() });
+  app.get('/api/admin/couriers', requireAuth, requireAdmin, async (_req, res) => {
+    try {
+      const couriers = await listDriversPersistent();
+      res.json({ couriers });
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Erro ao carregar motoboys.',
+      });
+    }
   });
 
-  app.post('/api/admin/couriers', requireAuth, requireAdmin, (req, res) => {
+  app.post('/api/admin/couriers', requireAuth, requireAdmin, async (req, res) => {
     const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
     const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
     const whatsapp = typeof req.body?.whatsapp === 'string' ? req.body.whatsapp.trim() : '';
@@ -1838,27 +2282,48 @@ async function startServer(): Promise<void> {
       return;
     }
 
-    const created = createUserRecord({
-      name,
-      email,
-      whatsapp,
-      passwordHash: hashPassword(password),
-      role: 'courier',
-    });
+    const passwordHash = hashPassword(password);
 
-    res.status(201).json({
-      courier: {
+    try {
+      if (isSupabaseConfigured()) {
+        const createdDriver = await createDriverPersistent({
+          name,
+          email,
+          whatsapp,
+          passwordHash,
+        });
+        pushAdminEvent('store_updated', { entity: 'couriers', action: 'created', courierId: createdDriver.id });
+        res.status(201).json({ courier: createdDriver });
+        return;
+      }
+
+      const created = createUserRecord({
+        name,
+        email,
+        whatsapp,
+        passwordHash,
+        role: 'courier',
+      });
+
+      const courier = {
         id: created.id,
         name: created.name,
         email: created.email,
         whatsapp: created.whatsapp,
         active: created.active !== false,
         createdAt: created.createdAt,
-      },
-    });
+      };
+      pushAdminEvent('store_updated', { entity: 'couriers', action: 'created', courierId: courier.id });
+      res.status(201).json({ courier });
+    } catch (err) {
+      console.error('Create courier error:', err);
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Erro ao cadastrar motoboy no banco.',
+      });
+    }
   });
 
-  app.patch('/api/admin/couriers/:id', requireAuth, requireAdmin, (req, res) => {
+  app.patch('/api/admin/couriers/:id', requireAuth, requireAdmin, async (req, res) => {
     const id = Number(req.params.id);
     if (!Number.isInteger(id)) {
       res.status(400).json({ error: 'ID inválido.' });
@@ -1871,25 +2336,34 @@ async function startServer(): Promise<void> {
     }
 
     const active = req.body?.active !== false ? 1 : 0;
-    db.prepare("UPDATE users SET active = ? WHERE id = ? AND role = 'courier' AND COALESCE(archived, 0) = 0").run(
-      active,
-      id
-    );
-    const updated = getUserById(id)!;
-    pushAdminEvent('store_updated', { entity: 'couriers', action: 'toggled', courierId: id });
-    res.json({
-      courier: {
-        id: updated.id,
-        name: updated.name,
-        email: updated.email,
-        whatsapp: updated.whatsapp,
-        active: updated.active !== false,
-        createdAt: updated.createdAt,
-      },
-    });
+    try {
+      if (isSupabaseConfigured()) {
+        await updateDriverPersistent(existing.email, { active: active === 1 });
+      }
+      db.prepare("UPDATE users SET active = ? WHERE id = ? AND role = 'courier' AND COALESCE(archived, 0) = 0").run(
+        active,
+        id
+      );
+      const updated = getUserById(id)!;
+      pushAdminEvent('store_updated', { entity: 'couriers', action: 'toggled', courierId: id });
+      res.json({
+        courier: {
+          id: updated.id,
+          name: updated.name,
+          email: updated.email,
+          whatsapp: updated.whatsapp,
+          active: updated.active !== false,
+          createdAt: updated.createdAt,
+        },
+      });
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Erro ao atualizar motoboy.',
+      });
+    }
   });
 
-  app.put('/api/admin/couriers/:id', requireAuth, requireAdmin, (req, res) => {
+  app.put('/api/admin/couriers/:id', requireAuth, requireAdmin, async (req, res) => {
     const id = Number(req.params.id);
     if (!Number.isInteger(id)) {
       res.status(400).json({ error: 'ID inválido.' });
@@ -1926,36 +2400,53 @@ async function startServer(): Promise<void> {
       return;
     }
 
-    if (password) {
+    const nextHash = password ? hashPassword(password) : undefined;
+
+    try {
+      if (isSupabaseConfigured()) {
+        await updateDriverPersistent(existing.email, {
+          name,
+          email,
+          whatsapp,
+          active: active === 1,
+          passwordHash: nextHash,
+        });
+      }
+
+      if (nextHash) {
+        db.prepare(
+          "UPDATE users SET name = ?, email = ?, whatsapp = ?, active = ?, passwordHash = ? WHERE id = ? AND role = 'courier'"
+        ).run(name, email, whatsapp, active, nextHash, id);
+      } else {
+        db.prepare(
+          "UPDATE users SET name = ?, email = ?, whatsapp = ?, active = ? WHERE id = ? AND role = 'courier'"
+        ).run(name, email, whatsapp, active, id);
+      }
+
       db.prepare(
-        "UPDATE users SET name = ?, email = ?, whatsapp = ?, active = ?, passwordHash = ? WHERE id = ? AND role = 'courier'"
-      ).run(name, email, whatsapp, active, hashPassword(password), id);
-    } else {
-      db.prepare(
-        "UPDATE users SET name = ?, email = ?, whatsapp = ?, active = ? WHERE id = ? AND role = 'courier'"
-      ).run(name, email, whatsapp, active, id);
+        "UPDATE orders SET assignedCourierName = ? WHERE assignedCourierId = ? AND status NOT IN ('Entregue', 'Concluído', 'Cancelado')"
+      ).run(name, id);
+
+      const updated = getUserById(id)!;
+      pushAdminEvent('store_updated', { entity: 'couriers', action: 'updated', courierId: id });
+      res.json({
+        courier: {
+          id: updated.id,
+          name: updated.name,
+          email: updated.email,
+          whatsapp: updated.whatsapp,
+          active: updated.active !== false,
+          createdAt: updated.createdAt,
+        },
+      });
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Erro ao atualizar motoboy no banco.',
+      });
     }
-
-    // Keep assignedCourierName synced on active pending orders
-    db.prepare(
-      "UPDATE orders SET assignedCourierName = ? WHERE assignedCourierId = ? AND status NOT IN ('Entregue', 'Concluído', 'Cancelado')"
-    ).run(name, id);
-
-    const updated = getUserById(id)!;
-    pushAdminEvent('store_updated', { entity: 'couriers', action: 'updated', courierId: id });
-    res.json({
-      courier: {
-        id: updated.id,
-        name: updated.name,
-        email: updated.email,
-        whatsapp: updated.whatsapp,
-        active: updated.active !== false,
-        createdAt: updated.createdAt,
-      },
-    });
   });
 
-  app.delete('/api/admin/couriers/:id', requireAuth, requireAdmin, (req, res) => {
+  app.delete('/api/admin/couriers/:id', requireAuth, requireAdmin, async (req, res) => {
     const id = Number(req.params.id);
     if (!Number.isInteger(id)) {
       res.status(400).json({ error: 'ID inválido.' });
@@ -1974,37 +2465,46 @@ async function startServer(): Promise<void> {
     const trackingRef = db
       .prepare('SELECT 1 FROM delivery_tracking_points WHERE courierId = ? LIMIT 1')
       .get(id);
+    const hasHistory = Boolean(orderRef || trackingRef);
 
-    db.exec('BEGIN IMMEDIATE');
     try {
-      // Unassign from non-finalized active orders
-      db.prepare(
-        "UPDATE orders SET assignedCourierId = NULL, assignedCourierName = '', trackingActive = 0 WHERE assignedCourierId = ? AND status NOT IN ('Entregue', 'Concluído', 'Cancelado')"
-      ).run(id);
-
-      if (orderRef || trackingRef) {
-        const archivedEmail = `archived_${id}_${Date.now()}_${existing.email}`;
-        db.prepare(
-          "UPDATE users SET archived = 1, active = 0, archivedAt = ?, email = ? WHERE id = ? AND role = 'courier'"
-        ).run(now, archivedEmail, id);
-      } else {
-        db.prepare("DELETE FROM users WHERE id = ? AND role = 'courier'").run(id);
+      if (isSupabaseConfigured()) {
+        await deleteDriverPersistent(existing.email, hasHistory);
       }
-      db.exec('COMMIT');
-    } catch (err) {
+
+      db.exec('BEGIN IMMEDIATE');
       try {
-        db.exec('ROLLBACK');
-      } catch {
-        // ignore
-      }
-      console.error('Delete courier error:', err);
-      res.status(500).json({ error: 'Erro ao excluir motoboy.' });
-      return;
-    }
+        db.prepare(
+          "UPDATE orders SET assignedCourierId = NULL, assignedCourierName = '', trackingActive = 0 WHERE assignedCourierId = ? AND status NOT IN ('Entregue', 'Concluído', 'Cancelado')"
+        ).run(id);
 
-    pushUserEvent(id, 'order_updated', { action: 'courier_removed' });
-    pushAdminEvent('store_updated', { entity: 'couriers', action: 'deleted', courierId: id });
-    res.json({ deleted: true });
+        if (hasHistory) {
+          const archivedEmail = `archived_${id}_${Date.now()}_${existing.email}`;
+          db.prepare(
+            "UPDATE users SET archived = 1, active = 0, archivedAt = ?, email = ? WHERE id = ? AND role = 'courier'"
+          ).run(now, archivedEmail, id);
+        } else {
+          db.prepare("DELETE FROM users WHERE id = ? AND role = 'courier'").run(id);
+        }
+        db.exec('COMMIT');
+      } catch (innerErr) {
+        try {
+          db.exec('ROLLBACK');
+        } catch {
+          // ignore
+        }
+        throw innerErr;
+      }
+
+      pushUserEvent(id, 'order_updated', { action: 'courier_removed' });
+      pushAdminEvent('store_updated', { entity: 'couriers', action: 'deleted', courierId: id });
+      res.json({ deleted: true, softDeleted: hasHistory });
+    } catch (err) {
+      console.error('Delete courier error:', err);
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Erro ao excluir motoboy.',
+      });
+    }
   });
 
   app.patch('/api/admin/orders/:id/assign-courier', requireAuth, requireAdmin, (req, res) => {
@@ -2155,12 +2655,13 @@ async function startServer(): Promise<void> {
     res.json({ settings: mapSettingsRow(row) });
   });
 
-  // Admin Products CRUD (automatically synced with R&P Profit Manager)
-  app.post('/api/admin/products', requireAuth, requireAdmin, (req: AuthenticatedRequest, res) => {
+  // Admin Products CRUD (persisted in Supabase when configured + synced with R&P Profit Manager)
+  app.post('/api/admin/products', requireAuth, requireAdmin, async (req: AuthenticatedRequest, res) => {
     const rawSku = typeof req.body?.sku === 'string' ? req.body.sku.trim().toUpperCase().slice(0, 40) : '';
     const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
     const category = typeof req.body?.category === 'string' ? req.body.category.trim() : '';
     const description = typeof req.body?.description === 'string' ? req.body.description.trim() : '';
+    const badgeLabel = typeof req.body?.badgeLabel === 'string' ? req.body.badgeLabel.trim().slice(0, 40) : '';
     const price = Number(req.body?.price);
     const costPrice = roundMoney(Math.max(0, Number(req.body?.costPrice || 0)));
     const freightCostUnit = roundMoney(Math.max(0, Number(req.body?.freightCostUnit || 0)));
@@ -2169,6 +2670,7 @@ async function startServer(): Promise<void> {
     const purchasedQuantity = Math.max(0, Math.round(Number(req.body?.purchasedQuantity || 0)));
     const stockQuantity = Math.max(0, Math.round(Number(req.body?.stockQuantity ?? purchasedQuantity)));
     const imageUrl = typeof req.body?.imageUrl === 'string' ? req.body.imageUrl.trim() : '';
+    const storagePath = typeof req.body?.storagePath === 'string' ? req.body.storagePath.trim() : '';
     const variationLabel =
       typeof req.body?.variationLabel === 'string' ? req.body.variationLabel.trim().slice(0, 60) : '';
     const variations = Array.isArray(req.body?.variations)
@@ -2181,6 +2683,7 @@ async function startServer(): Promise<void> {
     const secondaryVariations = Array.isArray(req.body?.secondaryVariations)
       ? req.body.secondaryVariations.map((v: unknown) => String(v).trim()).filter(Boolean)
       : [];
+    const variationStock = sanitizeVariationStockMap(req.body?.variationStock);
     const active = req.body?.active !== false ? 1 : 0;
 
     if (!name || !category || !Number.isFinite(price) || price <= 0) {
@@ -2193,25 +2696,78 @@ async function startServer(): Promise<void> {
     }
 
     const now = new Date().toISOString();
-    let newId = 0;
 
+    if (isSupabaseConfigured()) {
+      try {
+        const created = await createProductPersistent({
+          sku: rawSku,
+          name,
+          category,
+          description,
+          badgeLabel,
+          price: roundMoney(price),
+          costPrice,
+          freightCostUnit,
+          packagingCostUnit,
+          otherCostUnit,
+          purchasedQuantity,
+          stockQuantity,
+          imageUrl,
+          storagePath,
+          variationLabel: variationLabel || 'Sabor / Variação',
+          variations,
+          secondaryVariationLabel,
+          secondaryVariations,
+          variationStock,
+          active: active === 1,
+        });
+
+        recordProductCostSnapshot({
+          productId: created.id,
+          productNameSnapshot: name,
+          eventType: 'initial',
+          unitPurchaseCost: costPrice,
+          freightCostUnit,
+          packagingCostUnit,
+          otherCostUnit,
+          salePrice: roundMoney(price),
+          purchasedQuantity,
+          stockQuantity,
+          note: 'Produto cadastrado e salvo permanentemente',
+          recordedAt: now,
+        });
+
+        pushBroadcastEvent('products_updated', { action: 'created', productId: created.id });
+        res.status(201).json({ product: created });
+        return;
+      } catch (err) {
+        console.error('Supabase create product error:', err);
+        res.status(500).json({
+          error: err instanceof Error ? err.message : 'Erro ao salvar produto no Supabase.',
+        });
+        return;
+      }
+    }
+
+    let newId = 0;
     db.exec('BEGIN IMMEDIATE');
     try {
       const result = db
         .prepare(
           `INSERT INTO products (
-            sku, name, category, description, price,
+            sku, name, category, description, badgeLabel, price,
             costPrice, freightCostUnit, packagingCostUnit, otherCostUnit,
             purchasedQuantity, stockQuantity, archived,
-            imageUrl, variationLabel, variationsJson, secondaryVariationLabel, secondaryVariationsJson,
+            imageUrl, variationLabel, variationsJson, secondaryVariationLabel, secondaryVariationsJson, variationStockJson,
             active, createdAt, updatedAt
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)`
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(
           rawSku,
           name,
           category,
           description,
+          badgeLabel,
           roundMoney(price),
           costPrice,
           freightCostUnit,
@@ -2224,6 +2780,7 @@ async function startServer(): Promise<void> {
           JSON.stringify(variations),
           secondaryVariationLabel,
           JSON.stringify(secondaryVariations),
+          JSON.stringify(variationStock),
           active,
           now,
           now
@@ -2297,7 +2854,7 @@ async function startServer(): Promise<void> {
     res.status(201).json({ product });
   });
 
-  app.put('/api/admin/products/:id', requireAuth, requireAdmin, (req, res) => {
+  app.put('/api/admin/products/:id', requireAuth, requireAdmin, async (req, res) => {
     const id = Number(req.params.id);
     if (!Number.isInteger(id)) {
       res.status(400).json({ error: 'ID inválido.' });
@@ -2306,27 +2863,34 @@ async function startServer(): Promise<void> {
     const existingRow = db
       .prepare('SELECT * FROM products WHERE id = ? AND archived = 0')
       .get(id) as Record<string, unknown> | undefined;
-    if (!existingRow) {
+    if (!existingRow && !isSupabaseConfigured()) {
       res.status(404).json({ error: 'Produto não encontrado.' });
       return;
     }
 
-    const existing = mapProductRow(existingRow);
+    const existing = existingRow ? mapProductRow(existingRow) : null;
     const sku =
       typeof req.body?.sku === 'string' && req.body.sku.trim()
         ? req.body.sku.trim().toUpperCase().slice(0, 40)
-        : formatProductSku(id, existing.sku);
+        : formatProductSku(id, existing?.sku);
     const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
     const category = typeof req.body?.category === 'string' ? req.body.category.trim() : '';
     const description = typeof req.body?.description === 'string' ? req.body.description.trim() : '';
+    const badgeLabel =
+      req.body?.badgeLabel !== undefined
+        ? typeof req.body.badgeLabel === 'string'
+          ? req.body.badgeLabel.trim().slice(0, 40)
+          : ''
+        : existing?.badgeLabel || '';
     const price = Number(req.body?.price);
     const imageUrl = typeof req.body?.imageUrl === 'string' ? req.body.imageUrl.trim() : '';
+    const storagePath = typeof req.body?.storagePath === 'string' ? req.body.storagePath.trim() : undefined;
     const variationLabel =
       req.body?.variationLabel !== undefined
         ? typeof req.body.variationLabel === 'string'
           ? req.body.variationLabel.trim().slice(0, 60)
           : ''
-        : existing.variationLabel || '';
+        : existing?.variationLabel || '';
     const variations = Array.isArray(req.body?.variations)
       ? req.body.variations.map((v: unknown) => String(v).trim()).filter(Boolean)
       : [];
@@ -2335,40 +2899,43 @@ async function startServer(): Promise<void> {
         ? typeof req.body.secondaryVariationLabel === 'string'
           ? req.body.secondaryVariationLabel.trim().slice(0, 60)
           : ''
-        : existing.secondaryVariationLabel || '';
+        : existing?.secondaryVariationLabel || '';
     const secondaryVariations =
       req.body?.secondaryVariations !== undefined
         ? Array.isArray(req.body.secondaryVariations)
           ? req.body.secondaryVariations.map((v: unknown) => String(v).trim()).filter(Boolean)
           : []
-        : existing.secondaryVariations || [];
+        : existing?.secondaryVariations || [];
+    const variationStock =
+      req.body?.variationStock !== undefined
+        ? sanitizeVariationStockMap(req.body.variationStock)
+        : existing?.variationStock || {};
     const active = req.body?.active !== false ? 1 : 0;
 
-    // Preserve existing costs & stock when omitted; update if explicitly sent
     const nextCostPrice =
       req.body?.costPrice !== undefined
         ? roundMoney(Math.max(0, Number(req.body.costPrice)))
-        : roundMoney(existing.costPrice || 0);
+        : roundMoney(existing?.costPrice || 0);
     const nextFreightCost =
       req.body?.freightCostUnit !== undefined
         ? roundMoney(Math.max(0, Number(req.body.freightCostUnit)))
-        : roundMoney(existing.freightCostUnit || 0);
+        : roundMoney(existing?.freightCostUnit || 0);
     const nextPackagingCost =
       req.body?.packagingCostUnit !== undefined
         ? roundMoney(Math.max(0, Number(req.body.packagingCostUnit)))
-        : roundMoney(existing.packagingCostUnit || 0);
+        : roundMoney(existing?.packagingCostUnit || 0);
     const nextOtherCost =
       req.body?.otherCostUnit !== undefined
         ? roundMoney(Math.max(0, Number(req.body.otherCostUnit)))
-        : roundMoney(existing.otherCostUnit || 0);
+        : roundMoney(existing?.otherCostUnit || 0);
     const nextPurchasedQty =
       req.body?.purchasedQuantity !== undefined
         ? Math.max(0, Math.round(Number(req.body.purchasedQuantity)))
-        : Math.max(0, Math.round(Number(existing.purchasedQuantity || 0)));
+        : Math.max(0, Math.round(Number(existing?.purchasedQuantity || 0)));
     const nextStockQty =
       req.body?.stockQuantity !== undefined
         ? Math.max(0, Math.round(Number(req.body.stockQuantity)))
-        : Math.max(0, Math.round(Number(existing.stockQuantity || 0)));
+        : Math.max(0, Math.round(Number(existing?.stockQuantity || 0)));
 
     if (!name || !category || !Number.isFinite(price) || price <= 0) {
       res.status(400).json({ error: 'Nome, categoria e preço positivo são obrigatórios.' });
@@ -2380,6 +2947,49 @@ async function startServer(): Promise<void> {
     }
 
     const roundedPrice = roundMoney(price);
+    const now = new Date().toISOString();
+
+    if (isSupabaseConfigured()) {
+      try {
+        const updated = await updateProductPersistent(id, {
+          sku,
+          name,
+          category,
+          description,
+          badgeLabel,
+          price: roundedPrice,
+          costPrice: nextCostPrice,
+          freightCostUnit: nextFreightCost,
+          packagingCostUnit: nextPackagingCost,
+          otherCostUnit: nextOtherCost,
+          purchasedQuantity: nextPurchasedQty,
+          stockQuantity: nextStockQty,
+          imageUrl,
+          storagePath,
+          variationLabel,
+          variations,
+          secondaryVariationLabel,
+          secondaryVariations,
+          variationStock,
+          active: active === 1,
+        });
+        pushBroadcastEvent('products_updated', { action: 'updated', productId: updated.id });
+        res.json({ product: updated });
+        return;
+      } catch (err) {
+        console.error('Supabase update product error:', err);
+        res.status(500).json({
+          error: err instanceof Error ? err.message : 'Erro ao atualizar produto no Supabase.',
+        });
+        return;
+      }
+    }
+
+    if (!existing) {
+      res.status(404).json({ error: 'Produto não encontrado.' });
+      return;
+    }
+
     const priceChanged = roundedPrice !== roundMoney(existing.price);
     const costChanged =
       nextCostPrice !== roundMoney(existing.costPrice || 0) ||
@@ -2389,15 +2999,14 @@ async function startServer(): Promise<void> {
       nextPurchasedQty !== Math.round(Number(existing.purchasedQuantity || 0)) ||
       nextStockQty !== Math.round(Number(existing.stockQuantity || 0));
 
-    const now = new Date().toISOString();
     db.exec('BEGIN IMMEDIATE');
     try {
       db.prepare(
         `UPDATE products SET
-          sku = ?, name = ?, category = ?, description = ?, price = ?,
+          sku = ?, name = ?, category = ?, description = ?, badgeLabel = ?, price = ?,
           costPrice = ?, freightCostUnit = ?, packagingCostUnit = ?, otherCostUnit = ?,
           purchasedQuantity = ?, stockQuantity = ?,
-          imageUrl = ?, variationLabel = ?, variationsJson = ?, secondaryVariationLabel = ?, secondaryVariationsJson = ?,
+          imageUrl = ?, variationLabel = ?, variationsJson = ?, secondaryVariationLabel = ?, secondaryVariationsJson = ?, variationStockJson = ?,
           active = ?, updatedAt = ?
         WHERE id = ?`
       ).run(
@@ -2405,6 +3014,7 @@ async function startServer(): Promise<void> {
         name,
         category,
         description,
+        badgeLabel,
         roundedPrice,
         nextCostPrice,
         nextFreightCost,
@@ -2417,6 +3027,7 @@ async function startServer(): Promise<void> {
         JSON.stringify(variations),
         secondaryVariationLabel,
         JSON.stringify(secondaryVariations),
+        JSON.stringify(variationStock),
         active,
         now,
         id
@@ -2460,7 +3071,7 @@ async function startServer(): Promise<void> {
     res.json({ product });
   });
 
-  app.delete('/api/admin/products/:id', requireAuth, requireAdmin, (req, res) => {
+  app.delete('/api/admin/products/:id', requireAuth, requireAdmin, async (req, res) => {
     const id = Number(req.params.id);
     if (!Number.isInteger(id)) {
       res.status(400).json({ error: 'ID inválido.' });
@@ -2469,52 +3080,81 @@ async function startServer(): Promise<void> {
     const existingRow = db
       .prepare('SELECT * FROM products WHERE id = ? AND archived = 0')
       .get(id) as Record<string, unknown> | undefined;
-    if (!existingRow) {
+    if (!existingRow && !isSupabaseConfigured()) {
       res.status(404).json({ error: 'Produto não encontrado.' });
       return;
     }
 
-    const existing = mapProductRow(existingRow);
+    const existing = existingRow ? mapProductRow(existingRow) : null;
     const now = new Date().toISOString();
 
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      // Soft-archive to remove from active storefront & Profit Manager inventory while preserving cost & sales history
-      db.prepare('UPDATE products SET archived = 1, active = 0, archivedAt = ?, updatedAt = ? WHERE id = ?').run(
-        now,
-        now,
-        id
-      );
-
-      recordProductCostSnapshot({
-        productId: id,
-        productNameSnapshot: existing.name,
-        eventType: 'archived',
-        unitPurchaseCost: Number(existing.costPrice || 0),
-        freightCostUnit: Number(existing.freightCostUnit || 0),
-        packagingCostUnit: Number(existing.packagingCostUnit || 0),
-        otherCostUnit: Number(existing.otherCostUnit || 0),
-        salePrice: existing.price,
-        purchasedQuantity: Number(existing.purchasedQuantity || 0),
-        stockQuantity: Number(existing.stockQuantity || 0),
-        note: 'Produto removido do catálogo ativo (histórico preservado)',
-        recordedAt: now,
-      });
-
-      db.exec('COMMIT');
-    } catch (err) {
+    // Check if any existing order references this product ID (preserve historical order records)
+    const orderRows = db.prepare('SELECT itemsJson FROM orders').all() as { itemsJson: string }[];
+    const hasOrderRef = orderRows.some((o) => {
       try {
-        db.exec('ROLLBACK');
+        const parsed = JSON.parse(o.itemsJson) as { productId?: number }[];
+        return Array.isArray(parsed) && parsed.some((item) => Number(item.productId) === id);
       } catch {
-        // ignore
+        return false;
       }
-      console.error('Archive product error:', err);
-      res.status(500).json({ error: 'Erro ao remover produto.' });
-      return;
-    }
+    });
 
-    pushBroadcastEvent('products_updated', { action: 'archived', productId: id });
-    res.json({ deleted: true, archived: true });
+    try {
+      if (isSupabaseConfigured()) {
+        await deleteProductPersistent(id, hasOrderRef);
+      }
+
+      if (existing) {
+        db.exec('BEGIN IMMEDIATE');
+        try {
+          if (hasOrderRef) {
+            db.prepare('UPDATE products SET archived = 1, active = 0, archivedAt = ?, updatedAt = ? WHERE id = ?').run(
+              now,
+              now,
+              id
+            );
+            recordProductCostSnapshot({
+              productId: id,
+              productNameSnapshot: existing.name,
+              eventType: 'archived',
+              unitPurchaseCost: Number(existing.costPrice || 0),
+              freightCostUnit: Number(existing.freightCostUnit || 0),
+              packagingCostUnit: Number(existing.packagingCostUnit || 0),
+              otherCostUnit: Number(existing.otherCostUnit || 0),
+              salePrice: existing.price,
+              purchasedQuantity: Number(existing.purchasedQuantity || 0),
+              stockQuantity: Number(existing.stockQuantity || 0),
+              note: 'Produto removido do catálogo ativo (pedidos antigos preservados)',
+              recordedAt: now,
+            });
+          } else {
+            db.prepare('DELETE FROM product_cost_batches WHERE productId = ?').run(id);
+            db.prepare('DELETE FROM product_cost_history WHERE productId = ?').run(id);
+            db.prepare('DELETE FROM products WHERE id = ?').run(id);
+            if (existing.imageUrl?.startsWith('/api/media/')) {
+              const fname = existing.imageUrl.replace('/api/media/', '');
+              db.prepare('DELETE FROM uploaded_media WHERE filename = ?').run(fname);
+            }
+          }
+          db.exec('COMMIT');
+        } catch (innerErr) {
+          try {
+            db.exec('ROLLBACK');
+          } catch {
+            // ignore
+          }
+          throw innerErr;
+        }
+      }
+
+      pushBroadcastEvent('products_updated', { action: 'archived', productId: id });
+      res.json({ deleted: true, softDeleted: hasOrderRef });
+    } catch (err) {
+      console.error('Delete product error:', err);
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Erro ao excluir produto.',
+      });
+    }
   });
 
   // ================= R&P PROFIT MANAGER (ADMIN ONLY) =================
@@ -2563,14 +3203,15 @@ async function startServer(): Promise<void> {
         stockQuantity: req.body?.stockQuantity !== undefined ? Number(req.body.stockQuantity) : undefined,
         note: typeof req.body?.note === 'string' ? req.body.note : undefined,
       });
-      pushBroadcastEvent('products_updated', { action: 'profit_updated', productId: id });
-      res.json({ product: updated });
-    } catch (err) {
-      res.status(400).json({
-        error: err instanceof Error ? err.message : 'Erro ao atualizar dados de rentabilidade do produto.',
-      });
-    }
-  });
+        pushBroadcastEvent('products_updated', { action: 'profit_updated', productId: id });
+        void syncProductProfitToSupabase(updated);
+        res.json({ product: updated });
+      } catch (err) {
+        res.status(400).json({
+          error: err instanceof Error ? err.message : 'Erro ao atualizar dados de rentabilidade do produto.',
+        });
+      }
+    });
 
   app.post(
     '/api/admin/profit/products/:id/batches',
@@ -2599,6 +3240,7 @@ async function startServer(): Promise<void> {
           req.authUser?.id
         );
         pushBroadcastEvent('products_updated', { action: 'batch_registered', productId: id });
+        void syncProductProfitToSupabase(result.product);
         res.status(201).json(result);
       } catch (err) {
         res.status(400).json({
@@ -2747,15 +3389,17 @@ async function startServer(): Promise<void> {
     res.json({ deleted: true });
   });
 
-  // Admin Carousel CRUD
-  app.post('/api/admin/carousel', requireAuth, requireAdmin, (req, res) => {
+  // Admin Carousel CRUD (persisted in Supabase when configured + Storage cleanup on delete)
+  app.post('/api/admin/carousel', requireAuth, requireAdmin, async (req, res) => {
     const tag = typeof req.body?.tag === 'string' ? req.body.tag.trim() : '';
     const title = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
     const subtitle = typeof req.body?.subtitle === 'string' ? req.body.subtitle.trim() : '';
     const ctaText = typeof req.body?.ctaText === 'string' ? req.body.ctaText.trim() || 'Ver catálogo' : 'Ver catálogo';
     const targetCategory =
       typeof req.body?.targetCategory === 'string' ? req.body.targetCategory.trim() || 'Todos' : 'Todos';
+    const linkUrl = typeof req.body?.linkUrl === 'string' ? req.body.linkUrl.trim() : '';
     const imageUrl = typeof req.body?.imageUrl === 'string' ? req.body.imageUrl.trim() : '';
+    const storagePath = typeof req.body?.storagePath === 'string' ? req.body.storagePath.trim() : '';
     const sortOrder = Number.isFinite(Number(req.body?.sortOrder)) ? Number(req.body.sortOrder) : 1;
     const active = req.body?.active !== false ? 1 : 0;
 
@@ -2768,28 +3412,56 @@ async function startServer(): Promise<void> {
       return;
     }
 
-    const result = db
-      .prepare(
-        'INSERT INTO carousel_slides (tag, title, subtitle, ctaText, targetCategory, imageUrl, sortOrder, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-      )
-      .run(tag, title, subtitle, ctaText, targetCategory, imageUrl, sortOrder, active);
+    try {
+      if (isSupabaseConfigured()) {
+        const slide = await createSlidePersistent({
+          tag,
+          title,
+          subtitle,
+          ctaText,
+          targetCategory,
+          linkUrl,
+          imageUrl,
+          storagePath,
+          sortOrder,
+          active: active === 1,
+        });
+        pushBroadcastEvent('store_updated', { entity: 'carousel', action: 'created', slideId: slide.id });
+        res.status(201).json({ slide });
+        return;
+      }
 
-    const row = db.prepare('SELECT * FROM carousel_slides WHERE id = ?').get(Number(result.lastInsertRowid)) as Record<
-      string,
-      unknown
-    >;
-    pushBroadcastEvent('store_updated', { entity: 'carousel', action: 'created' });
-    res.status(201).json({ slide: mapSlideRow(row) });
+      const now = new Date().toISOString();
+      const result = db
+        .prepare(
+          'INSERT INTO carousel_slides (tag, title, subtitle, ctaText, targetCategory, linkUrl, imageUrl, storagePath, sortOrder, active, deleted, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)'
+        )
+        .run(tag, title, subtitle, ctaText, targetCategory, linkUrl, imageUrl, storagePath, sortOrder, active, now, now);
+
+      const row = db.prepare('SELECT * FROM carousel_slides WHERE id = ?').get(Number(result.lastInsertRowid)) as Record<
+        string,
+        unknown
+      >;
+      pushBroadcastEvent('store_updated', { entity: 'carousel', action: 'created' });
+      res.status(201).json({ slide: mapSlideRow(row) });
+    } catch (err) {
+      console.error('Create carousel slide error:', err);
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Erro ao salvar slide no banco de dados.',
+      });
+    }
   });
 
-  app.put('/api/admin/carousel/:id', requireAuth, requireAdmin, (req, res) => {
+  app.put('/api/admin/carousel/:id', requireAuth, requireAdmin, async (req, res) => {
     const id = Number(req.params.id);
     if (!Number.isInteger(id)) {
       res.status(400).json({ error: 'ID inválido.' });
       return;
     }
-    const existing = db.prepare('SELECT * FROM carousel_slides WHERE id = ?').get(id);
-    if (!existing) {
+    const existing = db
+      .prepare('SELECT * FROM carousel_slides WHERE id = ? AND COALESCE(deleted, 0) = 0')
+      .get(id) as Record<string, unknown> | undefined;
+    if (!existing && !isSupabaseConfigured()) {
       res.status(404).json({ error: 'Slide não encontrado.' });
       return;
     }
@@ -2800,7 +3472,9 @@ async function startServer(): Promise<void> {
     const ctaText = typeof req.body?.ctaText === 'string' ? req.body.ctaText.trim() || 'Ver catálogo' : 'Ver catálogo';
     const targetCategory =
       typeof req.body?.targetCategory === 'string' ? req.body.targetCategory.trim() || 'Todos' : 'Todos';
+    const linkUrl = typeof req.body?.linkUrl === 'string' ? req.body.linkUrl.trim() : '';
     const imageUrl = typeof req.body?.imageUrl === 'string' ? req.body.imageUrl.trim() : '';
+    const storagePath = typeof req.body?.storagePath === 'string' ? req.body.storagePath.trim() : undefined;
     const sortOrder = Number.isFinite(Number(req.body?.sortOrder)) ? Number(req.body.sortOrder) : 1;
     const active = req.body?.active !== false ? 1 : 0;
 
@@ -2813,24 +3487,87 @@ async function startServer(): Promise<void> {
       return;
     }
 
-    db.prepare(
-      'UPDATE carousel_slides SET tag = ?, title = ?, subtitle = ?, ctaText = ?, targetCategory = ?, imageUrl = ?, sortOrder = ?, active = ? WHERE id = ?'
-    ).run(tag, title, subtitle, ctaText, targetCategory, imageUrl, sortOrder, active, id);
+    try {
+      if (isSupabaseConfigured()) {
+        const slide = await updateSlidePersistent(id, {
+          tag,
+          title,
+          subtitle,
+          ctaText,
+          targetCategory,
+          linkUrl,
+          imageUrl,
+          storagePath,
+          sortOrder,
+          active: active === 1,
+        });
+        pushBroadcastEvent('store_updated', { entity: 'carousel', action: 'updated', slideId: id });
+        res.json({ slide });
+        return;
+      }
 
-    const row = db.prepare('SELECT * FROM carousel_slides WHERE id = ?').get(id) as Record<string, unknown>;
-    pushBroadcastEvent('store_updated', { entity: 'carousel', action: 'updated', slideId: id });
-    res.json({ slide: mapSlideRow(row) });
+      const now = new Date().toISOString();
+      db.prepare(
+        'UPDATE carousel_slides SET tag = ?, title = ?, subtitle = ?, ctaText = ?, targetCategory = ?, linkUrl = ?, imageUrl = ?, storagePath = COALESCE(?, storagePath), sortOrder = ?, active = ?, updatedAt = ? WHERE id = ?'
+      ).run(
+        tag,
+        title,
+        subtitle,
+        ctaText,
+        targetCategory,
+        linkUrl,
+        imageUrl,
+        storagePath ?? null,
+        sortOrder,
+        active,
+        now,
+        id
+      );
+
+      const row = db.prepare('SELECT * FROM carousel_slides WHERE id = ?').get(id) as Record<string, unknown>;
+      pushBroadcastEvent('store_updated', { entity: 'carousel', action: 'updated', slideId: id });
+      res.json({ slide: mapSlideRow(row) });
+    } catch (err) {
+      console.error('Update carousel slide error:', err);
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Erro ao atualizar slide no banco.',
+      });
+    }
   });
 
-  app.delete('/api/admin/carousel/:id', requireAuth, requireAdmin, (req, res) => {
+  app.delete('/api/admin/carousel/:id', requireAuth, requireAdmin, async (req, res) => {
     const id = Number(req.params.id);
     if (!Number.isInteger(id)) {
       res.status(400).json({ error: 'ID inválido.' });
       return;
     }
-    db.prepare('DELETE FROM carousel_slides WHERE id = ?').run(id);
-    pushBroadcastEvent('store_updated', { entity: 'carousel', action: 'deleted', slideId: id });
-    res.json({ deleted: true });
+
+    const existing = db.prepare('SELECT * FROM carousel_slides WHERE id = ?').get(id) as
+      | Record<string, unknown>
+      | undefined;
+
+    try {
+      if (isSupabaseConfigured()) {
+        await deleteSlidePersistent(id);
+      }
+
+      if (existing) {
+        const existingUrl = String(existing.imageUrl || '');
+        if (existingUrl.startsWith('/api/media/')) {
+          const fname = existingUrl.replace('/api/media/', '');
+          db.prepare('DELETE FROM uploaded_media WHERE filename = ?').run(fname);
+        }
+        db.prepare('DELETE FROM carousel_slides WHERE id = ?').run(id);
+      }
+
+      pushBroadcastEvent('store_updated', { entity: 'carousel', action: 'deleted', slideId: id });
+      res.json({ deleted: true });
+    } catch (err) {
+      console.error('Delete carousel slide error:', err);
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Erro ao excluir slide.',
+      });
+    }
   });
 
   // Admin Store Settings
@@ -2971,6 +3708,33 @@ async function startServer(): Promise<void> {
 
       const existingOrder = mapOrderRow(existingRow);
       let grantedNow = 0;
+      let stockChanged = false;
+
+      if (status === 'Confirmado' && !existingOrder.stockDeducted) {
+        const stockValidation = validateOrderItemsStock(existingOrder.items);
+        if (stockValidation.ok === false) {
+          db.exec('ROLLBACK');
+          res.status(400).json({
+            error: `${stockValidation.error} Ajuste o estoque do produto se desejar confirmar este pedido.`,
+          });
+          return;
+        }
+        const lockStock = db
+          .prepare('UPDATE orders SET stockDeducted = 1 WHERE id = ? AND stockDeducted = 0')
+          .run(id);
+        if (lockStock.changes === 1) {
+          adjustInventoryForOrderItems(existingOrder.items, 'deduct');
+          stockChanged = true;
+        }
+      } else if (status === 'Cancelado' && existingOrder.stockDeducted) {
+        const lockRestore = db
+          .prepare('UPDATE orders SET stockDeducted = 0 WHERE id = ? AND stockDeducted = 1')
+          .run(id);
+        if (lockRestore.changes === 1) {
+          adjustInventoryForOrderItems(existingOrder.items, 'restore');
+          stockChanged = true;
+        }
+      }
 
       if (status === 'Confirmado' && !existingOrder.rouletteGranted) {
         const chancesToGrant = Math.floor(existingOrder.subtotal / 50);
@@ -3048,6 +3812,18 @@ async function startServer(): Promise<void> {
       }
       pushAdminEvent('order_updated', statusPayload);
       pushAdminEvent('tracking_updated', tracking);
+      if (stockChanged) {
+        for (const item of existingOrder.items) {
+          const pRow = db.prepare('SELECT * FROM products WHERE id = ?').get(item.productId) as
+            | Record<string, unknown>
+            | undefined;
+          if (pRow) {
+            const p = mapProductRow(pRow);
+            void syncProductStockToSupabase(p.id, Number(p.stockQuantity ?? 0), p.variationStock || {});
+          }
+        }
+        pushBroadcastEvent('products_updated', { action: 'stock_updated', orderId: updatedOrder.id });
+      }
 
       if (grantedNow > 0) {
         pushUserEvent(updatedOrder.userId, 'roulette_updated', {
@@ -3055,6 +3831,9 @@ async function startServer(): Promise<void> {
           orderNumber: updatedOrder.orderNumber,
         });
       }
+
+      const customerAccount = getUserById(updatedOrder.userId);
+      void syncOrderToSupabase(updatedOrder, customerAccount?.email || '');
 
       res.json({ order: updatedOrder, chancesGranted: grantedNow });
     } catch (err) {
@@ -3091,6 +3870,7 @@ async function startServer(): Promise<void> {
   const port = Number(process.env.PORT || 3000);
   httpServer.listen(port, '0.0.0.0', () => {
     console.log(`R&P Tabacaria server running on http://0.0.0.0:${port}`);
+    startCouponReminderScheduler();
   });
 }
 
