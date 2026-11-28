@@ -4,6 +4,7 @@ import type {
   Coordinates,
   CourierSummary,
   Coupon,
+  CustomerSummary,
   DeliveryAddress,
   DeliveryMethod,
   DeliveryTrackingInfo,
@@ -11,9 +12,14 @@ import type {
   OrderStatus,
   PaymentMethod,
   Product,
+  ProductCostBatch,
+  ProductCostHistoryEntry,
+  ProfitOverviewResponse,
+  ProfitProductRow,
   RoulettePrize,
   RouletteSpin,
   RouletteStateResponse,
+  RzinRecommendation,
   ShippingEstimate,
   StoreSettings,
   User,
@@ -43,6 +49,7 @@ export interface AdminOverviewResponse {
   slides: CarouselSlide[];
   orders: Order[];
   couriers: CourierSummary[];
+  customers?: CustomerSummary[];
   settings: StoreSettings;
 }
 
@@ -167,6 +174,16 @@ export const api = {
     );
   },
 
+  markWelcomeSeen(token: string | null): Promise<{ user: User }> {
+    return request<{ user: User }>(
+      '/api/account/welcome-seen',
+      {
+        method: 'POST',
+      },
+      token
+    );
+  },
+
   lookupCep(token: string | null, cep: string): Promise<CepLookupResponse> {
     const clean = cep.replace(/\D/g, '');
     return request<CepLookupResponse>(`/api/cep/${clean}`, {}, token);
@@ -202,6 +219,20 @@ export const api = {
       {
         method: 'POST',
         body: JSON.stringify({ code, subtotal }),
+      },
+      token
+    );
+  },
+
+  chatWithRzin(
+    token: string | null,
+    messages: { role: 'user' | 'model'; text: string }[]
+  ): Promise<{ reply: string; recommendations: RzinRecommendation[] }> {
+    return request<{ reply: string; recommendations: RzinRecommendation[] }>(
+      '/api/rzin/chat',
+      {
+        method: 'POST',
+        body: JSON.stringify({ messages }),
       },
       token
     );
@@ -488,6 +519,31 @@ export const api = {
     );
   },
 
+  updateAdminCourier(
+    token: string | null,
+    courierId: number,
+    payload: { name: string; email: string; whatsapp: string; active: boolean; password?: string }
+  ): Promise<{ courier: CourierSummary }> {
+    return request<{ courier: CourierSummary }>(
+      `/api/admin/couriers/${courierId}`,
+      {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      },
+      token
+    );
+  },
+
+  deleteAdminCourier(token: string | null, courierId: number): Promise<{ deleted: boolean }> {
+    return request<{ deleted: boolean }>(
+      `/api/admin/couriers/${courierId}`,
+      {
+        method: 'DELETE',
+      },
+      token
+    );
+  },
+
   assignOrderCourier(
     token: string | null,
     orderId: number,
@@ -498,6 +554,70 @@ export const api = {
       {
         method: 'PATCH',
         body: JSON.stringify({ courierId }),
+      },
+      token
+    );
+  },
+
+  // R&P Profit Manager (Admin only)
+  getProfitOverview(token: string | null): Promise<ProfitOverviewResponse> {
+    return request<ProfitOverviewResponse>('/api/admin/profit/overview', {}, token);
+  },
+
+  getProfitProductDetail(
+    token: string | null,
+    productId: number
+  ): Promise<{
+    product: ProfitProductRow;
+    batches: ProductCostBatch[];
+    history: ProductCostHistoryEntry[];
+  }> {
+    return request(`/api/admin/profit/products/${productId}`, {}, token);
+  },
+
+  updateProfitProduct(
+    token: string | null,
+    productId: number,
+    payload: {
+      sku?: string;
+      price?: number;
+      costPrice?: number;
+      freightCostUnit?: number;
+      packagingCostUnit?: number;
+      otherCostUnit?: number;
+      purchasedQuantity?: number;
+      stockQuantity?: number;
+      note?: string;
+    }
+  ): Promise<{ product: ProfitProductRow }> {
+    return request<{ product: ProfitProductRow }>(
+      `/api/admin/profit/products/${productId}`,
+      {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      },
+      token
+    );
+  },
+
+  createProfitBatch(
+    token: string | null,
+    productId: number,
+    payload: {
+      quantityPurchased: number;
+      unitPurchaseCost: number;
+      freightCostUnit?: number;
+      packagingCostUnit?: number;
+      otherCostUnit?: number;
+      supplierNote?: string;
+      purchasedAt?: string;
+    }
+  ): Promise<{ product: ProfitProductRow; batch: ProductCostBatch }> {
+    return request<{ product: ProfitProductRow; batch: ProductCostBatch }>(
+      `/api/admin/profit/products/${productId}/batches`,
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
       },
       token
     );
