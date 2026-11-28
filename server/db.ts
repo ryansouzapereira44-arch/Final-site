@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -12,6 +13,7 @@ import type {
   Order,
   OrderStatus,
   Product,
+  ProductSuggestion,
   RouletteChance,
   RoulettePrize,
   RoulettePrizeType,
@@ -73,6 +75,7 @@ db.exec(`
     variationsJson TEXT NOT NULL DEFAULT '[]',
     secondaryVariationLabel TEXT NOT NULL DEFAULT '',
     secondaryVariationsJson TEXT NOT NULL DEFAULT '[]',
+    variationStockJson TEXT NOT NULL DEFAULT '{}',
     active INTEGER NOT NULL DEFAULT 1,
     createdAt TEXT NOT NULL,
     updatedAt TEXT NOT NULL
@@ -130,8 +133,11 @@ db.exec(`
     expiresAt TEXT,
     active INTEGER NOT NULL DEFAULT 1,
     usageCount INTEGER NOT NULL DEFAULT 0,
+    expirationReminderSentAt TEXT,
     createdAt TEXT NOT NULL
   );
+
+  CREATE INDEX IF NOT EXISTS idx_coupons_expiring_reminder ON coupons(ownerUserId, active, expiresAt);
 
   CREATE TABLE IF NOT EXISTS coupon_usages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -150,9 +156,24 @@ db.exec(`
     subtitle TEXT NOT NULL DEFAULT '',
     ctaText TEXT NOT NULL DEFAULT 'Ver catálogo',
     targetCategory TEXT NOT NULL DEFAULT 'Todos',
+    linkUrl TEXT NOT NULL DEFAULT '',
     imageUrl TEXT NOT NULL DEFAULT '',
+    storagePath TEXT NOT NULL DEFAULT '',
     sortOrder INTEGER NOT NULL DEFAULT 0,
-    active INTEGER NOT NULL DEFAULT 1
+    active INTEGER NOT NULL DEFAULT 1,
+    deleted INTEGER NOT NULL DEFAULT 0,
+    deletedAt TEXT,
+    createdAt TEXT NOT NULL DEFAULT '',
+    updatedAt TEXT NOT NULL DEFAULT ''
+  );
+
+  CREATE TABLE IF NOT EXISTS uploaded_media (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    filename TEXT UNIQUE NOT NULL,
+    mimeType TEXT NOT NULL,
+    data BLOB NOT NULL,
+    sizeBytes INTEGER NOT NULL,
+    createdAt TEXT NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS store_settings (
@@ -196,6 +217,7 @@ db.exec(`
     total REAL NOT NULL,
     status TEXT NOT NULL DEFAULT 'Pendente',
     rouletteGranted INTEGER NOT NULL DEFAULT 0,
+    stockDeducted INTEGER NOT NULL DEFAULT 0,
     notes TEXT NOT NULL DEFAULT '',
     createdAt TEXT NOT NULL,
     FOREIGN KEY (userId) REFERENCES users(id)
@@ -263,6 +285,16 @@ db.exec(`
     createdAt TEXT NOT NULL,
     FOREIGN KEY (userId) REFERENCES users(id)
   );
+
+  CREATE TABLE IF NOT EXISTS product_suggestions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    userId INTEGER NOT NULL,
+    customerName TEXT NOT NULL,
+    customerEmail TEXT NOT NULL,
+    suggestion TEXT NOT NULL,
+    createdAt TEXT NOT NULL,
+    FOREIGN KEY (userId) REFERENCES users(id)
+  );
 `);
 
 function ensureColumn(table: string, column: string, definition: string): void {
@@ -281,6 +313,7 @@ ensureColumn('coupons', 'allowedEmail', 'TEXT');
 ensureColumn('coupons', 'allowMultipleUses', 'INTEGER NOT NULL DEFAULT 1');
 ensureColumn('coupons', 'maxUses', 'INTEGER');
 ensureColumn('coupons', 'expiresAt', 'TEXT');
+ensureColumn('coupons', 'expirationReminderSentAt', 'TEXT');
 ensureColumn('roulette_spins', 'couponExpiresAt', 'TEXT');
 ensureColumn('orders', 'distanceKm', 'REAL');
 ensureColumn('orders', 'rouletteGranted', 'INTEGER NOT NULL DEFAULT 0');
@@ -324,6 +357,15 @@ ensureColumn('products', 'archivedAt', 'TEXT');
 ensureColumn('products', 'variationLabel', "TEXT NOT NULL DEFAULT ''");
 ensureColumn('products', 'secondaryVariationLabel', "TEXT NOT NULL DEFAULT ''");
 ensureColumn('products', 'secondaryVariationsJson', "TEXT NOT NULL DEFAULT '[]'");
+ensureColumn('products', 'variationStockJson', "TEXT NOT NULL DEFAULT '{}'");
+ensureColumn('products', 'badgeLabel', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('orders', 'stockDeducted', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('carousel_slides', 'linkUrl', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('carousel_slides', 'storagePath', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('carousel_slides', 'deleted', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('carousel_slides', 'deletedAt', 'TEXT');
+ensureColumn('carousel_slides', 'createdAt', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('carousel_slides', 'updatedAt', "TEXT NOT NULL DEFAULT ''");
 
 function seedInitialData(): void {
   const now = new Date().toISOString();
@@ -407,8 +449,8 @@ function seedInitialData(): void {
     const productsCount = db.prepare('SELECT COUNT(*) as count FROM products').get() as { count: number };
     if (productsCount.count === 0) {
       const insertProduct = db.prepare(`
-        INSERT INTO products (name, category, description, price, imageUrl, variationsJson, active, createdAt, updatedAt)
-        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+        INSERT INTO products (name, category, description, price, purchasedQuantity, stockQuantity, imageUrl, variationsJson, active, createdAt, updatedAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
       `);
 
       insertProduct.run(
@@ -416,6 +458,8 @@ function seedInitialData(): void {
         'Narguilés',
         'Setup completo em alumínio anodizado preto fosco com vaso de cristal fumê e mangueira de silicone.',
         349.9,
+        15,
+        15,
         '/src/assets/images/product_hookah_black_1795779511252.jpg',
         JSON.stringify(['Preto Fosco / Prata', 'Preto Total']),
         now,
@@ -427,6 +471,8 @@ function seedInitialData(): void {
         'Essências',
         'Corte fino com alta resistência ao calor e fumaça densa. Embalagem lacrada de 250g.',
         68.9,
+        24,
+        24,
         '/src/assets/images/product_tobacco_essence_1795779511616.jpg',
         JSON.stringify(['Dark Berry', 'Menta Glacial', 'Melancia Ice', 'Love 66', 'Uva Roxa']),
         now,
@@ -438,6 +484,8 @@ function seedInitialData(): void {
         'Essências',
         'Pack tradicional 50g com sabores clássicos e refrescantes para sessões equilibradas.',
         18.5,
+        30,
+        30,
         '/src/assets/images/product_tobacco_essence_1795779511616.jpg',
         JSON.stringify(['Hortelã', 'Morango com Creme', 'Maracujá', 'Limão Siciliano']),
         now,
@@ -449,6 +497,8 @@ function seedInitialData(): void {
         'Carvão',
         'Carvão 100% fibra de coco de alta duração, baixa cinza e sem alteração de sabor.',
         34.9,
+        20,
+        20,
         '/src/assets/images/product_coconut_charcoal_1795779511363.jpg',
         JSON.stringify(['Cubo 26mm (1kg)', 'Hexagonal (1kg)']),
         now,
@@ -460,6 +510,8 @@ function seedInitialData(): void {
         'Rosh & Acessórios',
         'Queimador artesanal em cerâmica esmaltada de alta retenção térmica para sessões longas.',
         49.9,
+        14,
+        14,
         '/src/assets/images/product_ceramic_rosh_1795779511909.jpg',
         JSON.stringify(['Borda Metálica', 'Preto Clássico']),
         now,
@@ -471,6 +523,8 @@ function seedInitialData(): void {
         'Pods & Vapes',
         'Dispositivo compacto recarregável USB-C com acabamento metálico fosco e fluxo ajustável.',
         159.9,
+        18,
+        18,
         '/src/assets/images/product_pod_device_1795779511951.jpg',
         JSON.stringify(['Mint Ice', 'Grape Ice', 'Strawberry Kiwi', 'Menthol']),
         now,
@@ -487,6 +541,17 @@ function seedInitialData(): void {
     }
 
     db.prepare("INSERT OR REPLACE INTO seed_meta (key, value) VALUES ('initial_seed_v1', '1')").run();
+  }
+
+  // One-time stock initialization for legacy seeded products that never had stock configured
+  const stockSeedDoneRow = db
+    .prepare("SELECT value FROM seed_meta WHERE key = 'initial_stock_seed_v1'")
+    .get() as { value: string } | undefined;
+  if (stockSeedDoneRow?.value !== '1') {
+    db.prepare(
+      'UPDATE products SET purchasedQuantity = 20, stockQuantity = 20, updatedAt = ? WHERE purchasedQuantity = 0 AND stockQuantity = 0 AND archived = 0'
+    ).run(now);
+    db.prepare("INSERT OR REPLACE INTO seed_meta (key, value) VALUES ('initial_stock_seed_v1', '1')").run();
   }
 
   // Backfill 7-day expiration on any legacy roulette coupons/spins missing expiresAt
@@ -619,6 +684,24 @@ export function formatProductSku(id: number, rawSku?: unknown): string {
   return cleaned || `RP-${String(id).padStart(4, '0')}`;
 }
 
+function parseVariationStockJson(raw: unknown): Record<string, number> {
+  try {
+    const parsed = JSON.parse(String(raw || '{}'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    const out: Record<string, number> = {};
+    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+      const key = String(k).trim();
+      const num = Number(v);
+      if (key && Number.isFinite(num)) {
+        out[key] = Math.max(0, Math.round(num));
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
 export function mapProductRow(row: Record<string, unknown>): Product {
   let variations: string[] = [];
   try {
@@ -645,6 +728,7 @@ export function mapProductRow(row: Record<string, unknown>): Product {
     name: String(row.name),
     category: String(row.category),
     description: String(row.description || ''),
+    badgeLabel: String(row.badgeLabel || ''),
     price: Number(row.price),
     costPrice: Number(row.costPrice || 0),
     freightCostUnit: Number(row.freightCostUnit || 0),
@@ -659,6 +743,7 @@ export function mapProductRow(row: Record<string, unknown>): Product {
     variations,
     secondaryVariationLabel: String(row.secondaryVariationLabel || ''),
     secondaryVariations,
+    variationStock: parseVariationStockJson(row.variationStockJson),
     active: Boolean(row.active),
     createdAt: String(row.createdAt),
     updatedAt: String(row.updatedAt),
@@ -691,12 +776,15 @@ export function mapPublicProductRow(row: Record<string, unknown>): Product {
     name: String(row.name),
     category: String(row.category),
     description: String(row.description || ''),
+    badgeLabel: String(row.badgeLabel || ''),
     price: Number(row.price),
+    stockQuantity: Math.max(0, Math.round(Number(row.stockQuantity || 0))),
     imageUrl: String(row.imageUrl || ''),
     variationLabel: String(row.variationLabel || ''),
     variations,
     secondaryVariationLabel: String(row.secondaryVariationLabel || ''),
     secondaryVariations,
+    variationStock: parseVariationStockJson(row.variationStockJson),
     active: Boolean(row.active),
     createdAt: String(row.createdAt),
     updatedAt: String(row.updatedAt),
@@ -738,9 +826,13 @@ export function mapSlideRow(row: Record<string, unknown>): CarouselSlide {
     subtitle: String(row.subtitle || ''),
     ctaText: String(row.ctaText || 'Ver catálogo'),
     targetCategory: String(row.targetCategory || 'Todos'),
+    linkUrl: String(row.linkUrl || ''),
     imageUrl: String(row.imageUrl || ''),
+    storagePath: String(row.storagePath || ''),
     sortOrder: Number(row.sortOrder || 0),
     active: Boolean(row.active),
+    createdAt: row.createdAt ? String(row.createdAt) : undefined,
+    updatedAt: row.updatedAt ? String(row.updatedAt) : undefined,
   };
 }
 
@@ -820,6 +912,7 @@ export function mapOrderRow(row: Record<string, unknown>): Order {
     total: Number(row.total),
     status: String(row.status) as OrderStatus,
     rouletteGranted: Boolean(row.rouletteGranted),
+    stockDeducted: Boolean(row.stockDeducted),
     notes: String(row.notes || ''),
     createdAt: String(row.createdAt),
     assignedCourierId:
@@ -971,6 +1064,17 @@ export function listCustomers(): CustomerSummary[] {
   }));
 }
 
+export function mapSuggestionRow(row: Record<string, unknown>): ProductSuggestion {
+  return {
+    id: Number(row.id),
+    userId: Number(row.userId),
+    customerName: String(row.customerName),
+    customerEmail: String(row.customerEmail),
+    suggestion: String(row.suggestion),
+    createdAt: String(row.createdAt),
+  };
+}
+
 export function hasUserUsedCoupon(couponId: number, userId: number): boolean {
   const row = db
     .prepare('SELECT id FROM coupon_usages WHERE couponId = ? AND userId = ? LIMIT 1')
@@ -1013,4 +1117,18 @@ export function createUserRecord(params: {
 export function markUserWelcomeSeen(userId: number): User | null {
   db.prepare('UPDATE users SET welcomeCampaignSeen = 1 WHERE id = ?').run(userId);
   return getUserById(userId);
+}
+
+export function getOrCreateSessionSecret(): string {
+  const existing = db
+    .prepare("SELECT value FROM seed_meta WHERE key = 'session_secret_v1'")
+    .get() as { value: string } | undefined;
+  if (existing?.value && existing.value.length >= 32) {
+    return existing.value;
+  }
+  const generated = crypto.randomBytes(32).toString('hex');
+  db.prepare("INSERT OR REPLACE INTO seed_meta (key, value) VALUES ('session_secret_v1', ?)").run(
+    generated
+  );
+  return generated;
 }
