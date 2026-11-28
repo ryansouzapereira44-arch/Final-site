@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { Check, ExternalLink, Plus, RotateCcw, Send, Star, X } from 'lucide-react';
 import { api } from '../lib/api';
 import { formatBRL } from '../lib/format';
-import type { Product, RzinChatMessage, RzinRecommendation } from '../types';
+import type { CartItem, Product, RzinChatMessage, RzinRecommendation } from '../types';
 import { SafeProductImage } from './BrandMark';
 
 const RZIN_MASCOT_IMAGE = '/assets/aistudio/IMG_3605_dc04d8e0.jpeg';
@@ -55,7 +55,12 @@ interface RzinAssistantProps {
   hideFloatingTrigger?: boolean;
   onOpen: () => void;
   onClose: () => void;
-  onAddToCart: (product: Product, variation: string) => void;
+  onAddToCart: (
+    product: Product,
+    variation: string,
+    quantity?: number,
+    variationDetails?: CartItem['variationDetails']
+  ) => void;
 }
 
 export function RzinAssistant({
@@ -137,8 +142,8 @@ export function RzinAssistant({
 
   function handleAddRecommended(rec: RzinRecommendation) {
     const realProduct = products.find((p) => p.id === rec.productId);
-    if (!realProduct) return;
-    onAddToCart(realProduct, rec.variation);
+    if (!realProduct || (realProduct.stockQuantity ?? 0) <= 0) return;
+    onAddToCart(realProduct, rec.variation, 1);
     const key = `${rec.productId}-${rec.variation}`;
     setAddedKey(key);
     window.setTimeout(() => {
